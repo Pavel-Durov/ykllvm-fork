@@ -24,8 +24,10 @@ struct SoftwareTracerPass : public ModulePass {
     LLVMContext &Context = M.getContext();
     if (externalFunc == NULL) {
       Type *ReturnType = Type::getVoidTy(Context);
-      FunctionType *FType = FunctionType::get(ReturnType, {}, false);
-      externalFunc = Function::Create(FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
+      PointerType *ArgType = PointerType::get(Context, 0);
+      FunctionType *FType = FunctionType::get(ReturnType, {ArgType}, false);
+      externalFunc = Function::Create(FType, GlobalVariable::ExternalLinkage,
+                                      YK_TRACE_FUNCTION, M);
       return true;
     }
     return false;
@@ -38,10 +40,10 @@ struct SoftwareTracerPass : public ModulePass {
       for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
         BasicBlock::iterator InsertPt = BB->getFirstInsertionPt();
         builder.SetInsertPoint(&*InsertPt);
-        builder.CreateCall(externalFunc);
+        BlockAddress *blockAddress = BlockAddress::get(&(*BB));
+        builder.CreateCall(externalFunc, {blockAddress});
       }
     }
-    M.dump();
     return true;
   }
 };
