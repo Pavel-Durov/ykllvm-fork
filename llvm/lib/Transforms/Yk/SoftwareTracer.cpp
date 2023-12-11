@@ -1,6 +1,4 @@
 #include "llvm/Transforms/Yk/SoftwareTracer.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -22,25 +20,28 @@ struct SoftwareTracerPass : public ModulePass {
 
   SoftwareTracerPass() : ModulePass(ID) {}
 
+  bool doInitialization(Module &M) override {
+    LLVMContext &Context = M.getContext();
+    if (externalFunc == NULL) {
+      Type *ReturnType = Type::getVoidTy(Context);
+      FunctionType *FType = FunctionType::get(ReturnType, {}, false);
+      externalFunc = Function::Create(FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
+      return true;
+    }
+    return false;
+  }
+
   bool runOnModule(Module &M) override {
     for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
       LLVMContext &Context = M.getContext();
-      if (externalFunc == NULL) {
-        FunctionType *FType =
-            FunctionType::get(Type::getVoidTy(Context), {}, false);
-        externalFunc = Function::Create(FType, GlobalVariable::ExternalLinkage,
-                                        YK_TRACE_FUNCTION, M);
-      }
+      IRBuilder<> builder(Context);
       for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
-        for (BasicBlock::iterator BI = BB->begin(), BE = BB->end(); BI != BE;
-             ++BI) {
-          // Insert function call instruction
-          IRBuilder<> builder(Context);
-          builder.SetInsertPoint(&(*BI));
-          builder.CreateCall(externalFunc);
-        }
+        BasicBlock::iterator InsertPt = BB->getFirstInsertionPt();
+        builder.SetInsertPoint(&*InsertPt);
+        builder.CreateCall(externalFunc);
       }
     }
+    M.dump();
     return true;
   }
 };
