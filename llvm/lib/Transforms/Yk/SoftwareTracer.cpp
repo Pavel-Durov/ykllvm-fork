@@ -13,7 +13,6 @@
 using namespace llvm;
 
 namespace {
-
 struct SoftwareTracerPass : public ModulePass {
   static char ID;
   Function *externalFunc = NULL;
@@ -24,8 +23,11 @@ struct SoftwareTracerPass : public ModulePass {
     LLVMContext &Context = M.getContext();
     if (externalFunc == NULL) {
       Type *ReturnType = Type::getVoidTy(Context);
-      PointerType *ArgType = PointerType::get(Context, 0);
-      FunctionType *FType = FunctionType::get(ReturnType, {ArgType}, false);
+      Type *functionIndexArgType = Type::getInt32Ty(Context);
+      Type *blockIndexArgType = Type::getInt32Ty(Context);
+
+      FunctionType *FType = FunctionType::get(
+          ReturnType, {functionIndexArgType, blockIndexArgType}, false);
       externalFunc = Function::Create(FType, GlobalVariable::ExternalLinkage,
                                       YK_TRACE_FUNCTION, M);
       return true;
@@ -34,16 +36,21 @@ struct SoftwareTracerPass : public ModulePass {
   }
 
   bool runOnModule(Module &M) override {
+    int functionIndex = 0;
     for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
       LLVMContext &Context = M.getContext();
       IRBuilder<> builder(Context);
+      int blockIndex = 0;
       for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
         BasicBlock::iterator InsertPt = BB->getFirstInsertionPt();
         builder.SetInsertPoint(&*InsertPt);
-        BlockAddress *blockAddress = BlockAddress::get(&(*BB));
-        builder.CreateCall(externalFunc, {blockAddress});
+        builder.CreateCall(externalFunc, {builder.getInt32(functionIndex),
+                                          builder.getInt32(blockIndex)});
+        ++blockIndex;
       }
+      ++functionIndex;
     }
+    M.dump();
     return true;
   }
 };
