@@ -272,10 +272,6 @@ static cl::opt<bool> YkPatchCtrlPoint("yk-patch-control-point", cl::init(false),
                                       cl::NotHidden,
                                       cl::desc("Patch yk_mt_control_point()"));
 
-static cl::opt<bool>
-    YkNoCallsInEntryBlocks("yk-no-calls-in-entryblocks", cl::init(false), cl::NotHidden,
-                      cl::desc("Ensure there are no calls in the entryblock."));
-
 static cl::opt<bool> YkLinkage("yk-linkage", cl::init(false),
                                       cl::NotHidden,
                                       cl::desc("Change functions with internal linkage to have external linkage"));
@@ -287,6 +283,10 @@ static cl::opt<bool>
 static cl::opt<bool>
     YkInsertStackMaps("yk-insert-stackmaps", cl::init(false), cl::NotHidden,
                       cl::desc("Insert stackmaps for JIT deoptimisation"));
+
+static cl::opt<bool>
+    YkNoCallsInEntryBlocks("yk-no-calls-in-entryblocks", cl::init(false), cl::NotHidden,
+                      cl::desc("Ensure there are no calls in the entryblock."));
 
 static cl::opt<bool>
     YkSoftwareTracer("yk-software-tracer", cl::init(false), cl::NotHidden,
