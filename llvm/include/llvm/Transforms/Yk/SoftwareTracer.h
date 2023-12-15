@@ -18,23 +18,26 @@ namespace llvm {
                 externalFunc = other.externalFunc;
             }
 
+            // Required by PassRegistry
             static StringRef name() {
                 return "SoftwareTracerPass";
             }
-            
+            // Required by PassRegistry
             bool run(Module &M) {
                 return true;
             }
+
             virtual bool runOnModule(Module &M) override;
             
             virtual bool doInitialization(Module &M) override ;
             
+            // Required by PassRegistry
             void printPipeline(raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
                 /* DO NOTHING */
             }
-
+            // Required by PassRegistry
             PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM){
-                return PreservedAnalyses::all();
+                return PreservedAnalyses::none();
             }
     };
 } // namespace llvm
