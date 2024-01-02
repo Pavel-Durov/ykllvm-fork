@@ -7,7 +7,7 @@ add_llvm_component_library(LLVMYkPasses
   ShadowStack.cpp
   NoCallsInEntryBlocks.cpp
   SplitBlocksAfterCalls.cpp
-
+  SoftwareTracer.cpp
   DEPENDS
   intrinsics_gen
 

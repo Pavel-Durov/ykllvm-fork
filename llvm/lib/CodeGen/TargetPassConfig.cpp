@@ -55,6 +55,7 @@
 #include "llvm/Transforms/Yk/SplitBlocksAfterCalls.h"
 #include "llvm/Transforms/Yk/Stackmaps.h"
 #include "llvm/Transforms/Yk/NoCallsInEntryBlocks.h"
+#include "llvm/Transforms/Yk/SoftwareTracer.h"
 #include <cassert>
 #include <optional>
 #include <string>
@@ -285,8 +286,8 @@ static cl::opt<bool>
                       cl::desc("Insert stackmaps for JIT deoptimisation"));
 
 static cl::opt<bool>
-    YkNoCallsInEntryBlocks("yk-no-calls-in-entryblocks", cl::init(false), cl::NotHidden,
-                      cl::desc("Ensure there are no calls in the entryblock."));
+    YkSoftwareTracer("yk-software-tracer", cl::init(false), cl::NotHidden,
+                      cl::desc("Enables YK Software Tracer capability"));
 
 static cl::opt<bool>
     YkSplitBlocksAfterCalls("yk-split-blocks-after-calls", cl::init(false), cl::NotHidden,
@@ -1179,6 +1180,10 @@ bool TargetPassConfig::addISelPasses() {
 
   if (YkInsertStackMaps) {
     addPass(createYkStackmapsPass());
+  }
+
+  if (YkSoftwareTracer) {
+    addPass(createSoftwareTracerPass());
   }
 
   addISelPrepare();
