@@ -8,7 +8,7 @@ add_llvm_component_library(LLVMYkPasses
   NoCallsInEntryBlocks.cpp
   SplitBlocksAfterCalls.cpp
   BasicBlockTracer.cpp
-
+  SoftwareTracer.cpp
   DEPENDS
   intrinsics_gen
 
