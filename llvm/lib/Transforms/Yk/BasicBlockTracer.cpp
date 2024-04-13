@@ -54,14 +54,24 @@ struct YkBasicBlockTracer : public ModulePass {
         for (auto &I : BB) {
           if (auto *call = dyn_cast<CallInst>(&I)) {
             Function *calledFunction = call->getCalledFunction();
-            if (calledFunction && calledFunction->isDeclaration() &&
+            if (calledFunction &&
                 calledFunction->getName() != YK_TRACE_FUNCTION &&
                 calledFunction->getName().startswith("llvm.") == false) {
-              // Insert EXTERNAL_CALL tracing call before the call instruction.
+              if (calledFunction->isDeclaration()) {
+                // Insert EXTERNAL_CALL tracing call before the call
+                builder.SetInsertPoint(call);
+                builder.CreateCall(TraceFunc,
+                                   {builder.getInt32(FunctionIndex),
+                                    builder.getInt32(BlockIndex),
+                                    builder.getInt32(EXTERNAL_CALL)});
+              }
+            }
+            if (!call->getCalledFunction()) {
+              // Insert INDIRECT_CALL tracing call before the call
               builder.SetInsertPoint(call);
               builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
                                              builder.getInt32(BlockIndex),
-                                             builder.getInt32(EXTERNAL_CALL)});
+                                             builder.getInt32(INDIRECT_CALL)});
             }
           }
         }
