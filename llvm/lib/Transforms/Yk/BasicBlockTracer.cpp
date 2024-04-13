@@ -21,6 +21,12 @@ namespace {
 struct YkBasicBlockTracer : public ModulePass {
   static char ID;
 
+  enum TraceType : int {
+    BASIC_BLOCK = 0,
+    EXTERNAL_CALL = 1,
+    INDIRECT_CALL = 2
+  };
+
   YkBasicBlockTracer() : ModulePass(ID) {
     initializeYkBasicBlockTracerPass(*PassRegistry::getPassRegistry());
   }
@@ -32,9 +38,11 @@ struct YkBasicBlockTracer : public ModulePass {
     Type *ReturnType = Type::getVoidTy(Context);
     Type *FunctionIndexArgType = Type::getInt32Ty(Context);
     Type *BlockIndexArgType = Type::getInt32Ty(Context);
+    Type *TracingType = Type::getInt32Ty(Context);
 
     FunctionType *FType = FunctionType::get(
-        ReturnType, {FunctionIndexArgType, BlockIndexArgType}, false);
+        ReturnType, {FunctionIndexArgType, BlockIndexArgType, TracingType},
+        false);
     Function *TraceFunc = Function::Create(
         FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
 
@@ -43,26 +51,28 @@ struct YkBasicBlockTracer : public ModulePass {
     for (auto &F : M) {
       uint32_t BlockIndex = 0;
       for (auto &BB : F) {
-        builder.SetInsertPoint(&*BB.getFirstInsertionPt());
-        builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
-                                       builder.getInt32(BlockIndex)});
-        assert(BlockIndex != UINT32_MAX &&
-               "Expected BlockIndex to not overflow");
-        BlockIndex++;
         for (auto &I : BB) {
           if (auto *call = dyn_cast<CallInst>(&I)) {
-            if (call->isIndirectCall()) {
-              errs() << "Indirect call detected: " << call << "\n";
-              // Value *funcPtr = call->getCalledValue();
-              // Do something with funcPtr, e.g., print its name if possible
-              // if (funcPtr->hasName()) {
-              //   errs() << "@@@@ Function pointer name: " << funcPtr->getName() << "\n";
-              // } else {
-              //   errs() << "@@@@ Function pointer is an unnamed value\n";
-              // }
+            Function *calledFunction = call->getCalledFunction();
+            if (calledFunction && calledFunction->isDeclaration() &&
+                calledFunction->getName() != YK_TRACE_FUNCTION &&
+                calledFunction->getName().startswith("llvm.") == false) {
+              // Insert EXTERNAL_CALL tracing call before the call instruction.
+              builder.SetInsertPoint(call);
+              builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
+                                             builder.getInt32(BlockIndex),
+                                             builder.getInt32(EXTERNAL_CALL)});
             }
           }
         }
+        // Insert BASIC_BLOCK tracing call before the call instruction.
+        builder.SetInsertPoint(&*BB.getFirstInsertionPt());
+        builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
+                                       builder.getInt32(BlockIndex),
+                                       builder.getInt32(BASIC_BLOCK)});
+        assert(BlockIndex != UINT32_MAX &&
+               "Expected BlockIndex to not overflow");
+        BlockIndex++;
       }
       assert(FunctionIndex != UINT32_MAX &&
              "Expected FunctionIndex to not overflow");
