@@ -7,6 +7,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
 
 #define DEBUG_TYPE "yk-basicblock-tracer-pass"
@@ -54,9 +55,13 @@ struct YkBasicBlockTracer : public ModulePass {
         for (auto &I : BB) {
           if (auto *call = dyn_cast<CallInst>(&I)) {
             Function *calledFunction = call->getCalledFunction();
+
+            if (isa<DbgInfoIntrinsic>(I)) {
+              continue;
+            }
+
             if (calledFunction &&
-                calledFunction->getName() != YK_TRACE_FUNCTION &&
-                calledFunction->getName().startswith("llvm.") == false) {
+                calledFunction->getName() != YK_TRACE_FUNCTION) {
               if (calledFunction->isDeclaration()) {
                 // Insert EXTERNAL_CALL tracing call before the call
                 builder.SetInsertPoint(call);
@@ -69,9 +74,12 @@ struct YkBasicBlockTracer : public ModulePass {
             if (!call->getCalledFunction()) {
               // Insert INDIRECT_CALL tracing call before the call
               builder.SetInsertPoint(call);
-              builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
-                                             builder.getInt32(BlockIndex),
-                                             builder.getInt32(INDIRECT_CALL)});
+              // TODO: set function ptr as argument
+              // Value *funcPtr = call->getCalledOperand();  // Correct method
+              // to get the callee builder.CreateCall(TraceFunc,
+              // {builder.getInt32(FunctionIndex),
+              //                                funcPtr,
+              //                                builder.getInt32(INDIRECT_CALL)});
             }
           }
         }
