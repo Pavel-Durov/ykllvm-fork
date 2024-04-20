@@ -59,6 +59,9 @@ struct YkBasicBlockTracer : public ModulePass {
             if (isa<DbgInfoIntrinsic>(I)) {
               continue;
             }
+            if (calledFunction && calledFunction->isIntrinsic()) {
+              continue;
+            }
 
             if (calledFunction &&
                 calledFunction->getName() != YK_TRACE_FUNCTION) {
@@ -69,11 +72,12 @@ struct YkBasicBlockTracer : public ModulePass {
                                    {builder.getInt32(FunctionIndex),
                                     builder.getInt32(BlockIndex),
                                     builder.getInt32(EXTERNAL_CALL)});
+                // errs() << "[LLVM] External call detected: " << calledFunction->getName() << ", " << FunctionIndex  << ", " << BlockIndex << "\n";
               }
             }
             if (!call->getCalledFunction()) {
               // Insert INDIRECT_CALL tracing call before the call
-              builder.SetInsertPoint(call);
+              // builder.SetInsertPoint(call);
               // TODO: set function ptr as argument
               // Value *funcPtr = call->getCalledOperand();  // Correct method
               // to get the callee builder.CreateCall(TraceFunc,
@@ -88,6 +92,7 @@ struct YkBasicBlockTracer : public ModulePass {
         builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
                                        builder.getInt32(BlockIndex),
                                        builder.getInt32(BASIC_BLOCK)});
+        // errs() << "[LLVM] Start of BB. " << F.getName() << " " << FunctionIndex  << ", " << BlockIndex << "\n";
         assert(BlockIndex != UINT32_MAX &&
                "Expected BlockIndex to not overflow");
         BlockIndex++;
