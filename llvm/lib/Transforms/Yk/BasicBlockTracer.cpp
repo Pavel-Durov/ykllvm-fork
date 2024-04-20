@@ -4,10 +4,10 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
 
 #define DEBUG_TYPE "yk-basicblock-tracer-pass"
@@ -47,6 +47,15 @@ struct YkBasicBlockTracer : public ModulePass {
     Function *TraceFunc = Function::Create(
         FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
 
+    // Create externally linked function declaration:
+    //   void yk_trace_indirect_call(*c_void functionPtr)
+    FunctionType *IndirectCallTraceFunctionType = FunctionType::get(
+        Type::getVoidTy(Context), {Type::getInt8PtrTy(Context)}, false);
+
+    Function *IndirectCallTraceFunction = Function::Create(
+        IndirectCallTraceFunctionType, GlobalVariable::ExternalLinkage,
+        "yk_trace_indirect_call", M);
+
     IRBuilder<> builder(Context);
     uint32_t FunctionIndex = 0;
     for (auto &F : M) {
@@ -66,33 +75,32 @@ struct YkBasicBlockTracer : public ModulePass {
             if (calledFunction &&
                 calledFunction->getName() != YK_TRACE_FUNCTION) {
               if (calledFunction->isDeclaration()) {
-                // Insert EXTERNAL_CALL tracing call before the call
+                // Insert external tracing call
                 builder.SetInsertPoint(call);
                 builder.CreateCall(TraceFunc,
                                    {builder.getInt32(FunctionIndex),
                                     builder.getInt32(BlockIndex),
                                     builder.getInt32(EXTERNAL_CALL)});
-                // errs() << "[LLVM] External call detected: " << calledFunction->getName() << ", " << FunctionIndex  << ", " << BlockIndex << "\n";
               }
             }
             if (!call->getCalledFunction()) {
-              // Insert INDIRECT_CALL tracing call before the call
-              // builder.SetInsertPoint(call);
-              // TODO: set function ptr as argument
-              // Value *funcPtr = call->getCalledOperand();  // Correct method
-              // to get the callee builder.CreateCall(TraceFunc,
-              // {builder.getInt32(FunctionIndex),
-              //                                funcPtr,
-              //                                builder.getInt32(INDIRECT_CALL)});
+              Value *calledOperand = call->getCalledOperand();
+              // Insert indirect tracing call
+              if (calledOperand->getType()->isPointerTy()) {
+                builder.SetInsertPoint(call);
+                auto functionPtr = builder.CreateBitCast(
+                    calledOperand, Type::getInt8PtrTy(call->getContext()),
+                    "castToi8Ptr");
+                builder.CreateCall(IndirectCallTraceFunction, {calledOperand});
+              }
             }
           }
         }
-        // Insert BASIC_BLOCK tracing call before the call instruction.
+        // Insert basicblock tracing call
         builder.SetInsertPoint(&*BB.getFirstInsertionPt());
         builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
                                        builder.getInt32(BlockIndex),
                                        builder.getInt32(BASIC_BLOCK)});
-        // errs() << "[LLVM] Start of BB. " << F.getName() << " " << FunctionIndex  << ", " << BlockIndex << "\n";
         assert(BlockIndex != UINT32_MAX &&
                "Expected BlockIndex to not overflow");
         BlockIndex++;
