@@ -22,30 +22,62 @@ namespace {
 struct YkBasicBlockTracer : public ModulePass {
   static char ID;
 
-  enum TraceType : int {
-    BASIC_BLOCK = 0,
-    EXTERNAL_CALL = 1,
-    INDIRECT_CALL = 2
-  };
-
   YkBasicBlockTracer() : ModulePass(ID) {
     initializeYkBasicBlockTracerPass(*PassRegistry::getPassRegistry());
   }
 
+  void handleIndirectCall(CallInst *call, IRBuilder<> &builder,
+                          Function *traceFunction) {
+    Function *calledFunction = call->getCalledFunction();
+    if (!call->getCalledFunction()) {
+      Value *calledOperand = call->getCalledOperand();
+
+      if (calledOperand->getType()->isPointerTy()) {
+        // Insert indirect tracing call
+        builder.SetInsertPoint(call);
+        auto functionPtr = builder.CreateBitCast(
+            calledOperand, Type::getInt8PtrTy(call->getContext()),
+            "castToi8Ptr");
+        errs() << "[LLVM] Detected indirect call: " << *functionPtr << "\n";
+        builder.CreateCall(traceFunction, {functionPtr});
+      }
+    }
+  }
+
+  void handleUnmappableCall(CallInst *call, IRBuilder<> &builder,
+                            Function *traceFunction) {
+
+    Function *calledFunction = call->getCalledFunction();
+
+    if (calledFunction && calledFunction->getName() != YK_TRACE_FUNCTION &&
+        calledFunction->isDeclaration() &&
+        calledFunction->getName().startswith("yk_") == false &&
+        calledFunction->getName().startswith("__ykrt") == false) {
+      errs() << "[LLVM] Detected unmappable function: "
+             << calledFunction->getName() << "\n";
+      // Insert external tracing call
+      builder.SetInsertPoint(call);
+      builder.CreateCall(traceFunction);
+    }
+  }
   bool runOnModule(Module &M) override {
     LLVMContext &Context = M.getContext();
     // Create externally linked function declaration:
     //   void yk_trace_basicblock(int functionIndex, int blockIndex)
-    Type *ReturnType = Type::getVoidTy(Context);
-    Type *FunctionIndexArgType = Type::getInt32Ty(Context);
-    Type *BlockIndexArgType = Type::getInt32Ty(Context);
-    Type *TracingType = Type::getInt32Ty(Context);
-
     FunctionType *FType = FunctionType::get(
-        ReturnType, {FunctionIndexArgType, BlockIndexArgType, TracingType},
-        false);
+        Type::getVoidTy(Context),
+        {Type::getInt32Ty(Context), Type::getInt32Ty(Context)}, false);
     Function *TraceFunc = Function::Create(
         FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
+
+    // Create externally linked function declaration:
+    //   void yk_trace_unmappable(int functionIndex, int blockIndex)
+    FunctionType *UnmappableTraceFunctionType =
+        FunctionType::get(Type::getVoidTy(Context), {}, false);
+
+    Function *UnmappableTraceFunction = Function::Create(
+        UnmappableTraceFunctionType, GlobalVariable::ExternalLinkage,
+        "yk_trace_unmappable_call", M);
 
     // Create externally linked function declaration:
     //   void yk_trace_indirect_call(*c_void functionPtr)
@@ -72,35 +104,14 @@ struct YkBasicBlockTracer : public ModulePass {
               continue;
             }
 
-            if (calledFunction &&
-                calledFunction->getName() != YK_TRACE_FUNCTION) {
-              if (calledFunction->isDeclaration()) {
-                // Insert external tracing call
-                builder.SetInsertPoint(call);
-                builder.CreateCall(TraceFunc,
-                                   {builder.getInt32(FunctionIndex),
-                                    builder.getInt32(BlockIndex),
-                                    builder.getInt32(EXTERNAL_CALL)});
-              }
-            }
-            if (!call->getCalledFunction()) {
-              Value *calledOperand = call->getCalledOperand();
-              // Insert indirect tracing call
-              if (calledOperand->getType()->isPointerTy()) {
-                builder.SetInsertPoint(call);
-                auto functionPtr = builder.CreateBitCast(
-                    calledOperand, Type::getInt8PtrTy(call->getContext()),
-                    "castToi8Ptr");
-                builder.CreateCall(IndirectCallTraceFunction, {calledOperand});
-              }
-            }
+            handleUnmappableCall(call, builder, UnmappableTraceFunction);
+            // handleIndirectCall(call, builder, IndirectCallTraceFunction);
           }
         }
         // Insert basicblock tracing call
         builder.SetInsertPoint(&*BB.getFirstInsertionPt());
         builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
-                                       builder.getInt32(BlockIndex),
-                                       builder.getInt32(BASIC_BLOCK)});
+                                       builder.getInt32(BlockIndex)});
         assert(BlockIndex != UINT32_MAX &&
                "Expected BlockIndex to not overflow");
         BlockIndex++;
