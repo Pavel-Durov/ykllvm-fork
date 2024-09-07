@@ -36,7 +36,7 @@ struct YkBasicBlockTracer : public ModulePass {
     FunctionType *FType = FunctionType::get(
         ReturnType, {FunctionIndexArgType, BlockIndexArgType}, false);
     Function *TraceFunc = Function::Create(
-        FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
+        FType, GlobalVariable::ExternalLinkage, "__yk_trace_basicblock", M);
 
     IRBuilder<> builder(Context);
     uint32_t FunctionIndex = 0;
