@@ -789,12 +789,17 @@ private:
       serialiseOperand(I, FLCtxt, I->getOperand(OI));
     }
     bool IsCtrlPointCall = I->getCalledFunction()->getName() == CP_PPNAME;
-    if (!I->getCalledFunction()->isDeclaration() || IsCtrlPointCall) {
+    bool IsClonedFunction =
+        I->getFunction()->getName().startswith(YK_CLONE_PREFIX);
+    bool IsDeclaration = I->getCalledFunction()->isDeclaration();
+
+    if ((!IsDeclaration && !IsClonedFunction) || IsCtrlPointCall) {
       // The next instruction will be the stackmap entry
       // has_safepoint = 1:
+      llvm::errs() << "@@ serialiseCallInst -> has_safepoint = 1, function: "
+                   << I->getFunction()->getName() << "\n";
       OutStreamer.emitInt8(1);
       CallInst *SMI = nullptr;
-
       // The control point is special. We use a patchpoint to perform the
       // call, so the stackmap is associated with the patchpoint itself.
       //
@@ -802,20 +807,27 @@ private:
       // stackmap, but patchpoints can only return void or i64, which isn't
       // general enough for any given call we may encounter in the IR.
       //
-      // For non-control-point calls, we instead place a stackmap instruction
-      // after the call and rely on a pass (FixStackmapsSpillReloads) to "patch
-      // up" the MIR later. This is necessary because we want the live
-      // locations at the point of the call, but when you place stackmap
-      // instruction after the call, you don't generally get that: LLVM often
-      // inserts instructions between the call and the stackmap instruction
-      // which is (for us, undesirably) reflected in the stackmap entry.
+      // For non-control-point calls, we instead place a stackmap
+      // instruction after the call and rely on a pass
+      // (FixStackmapsSpillReloads) to "patch up" the MIR later. This is
+      // necessary because we want the live locations at the point of the
+      // call, but when you place stackmap instruction after the call, you
+      // don't generally get that: LLVM often inserts instructions between
+      // the call and the stackmap instruction which is (for us,
+      // undesirably) reflected in the stackmap entry.
       if (IsCtrlPointCall) {
         SMI = dyn_cast<CallInst>(I);
       } else {
         SMI = dyn_cast<CallInst>(I->getNextNonDebugInstruction());
       }
       serialiseStackmapCall(SMI, FLCtxt);
+
     } else {
+      if (!IsDeclaration) {
+          llvm::errs() << "@@ serialiseCallInst -> has_safepoint = 0, function: "
+                   << I->getFunction()->getName() << ", called function: "
+                   << I->getCalledFunction()->getName() << "\n";
+      }
       // has_safepoint = 0:
       OutStreamer.emitInt8(0);
     }
@@ -832,8 +844,11 @@ private:
     // We split LLVM's `br` into two Yk IR instructions: one for unconditional
     // branching, another for conidtional branching.
     if (!I->isConditional()) {
-      // We don't serialise the branch target for unconditional branches because
-      // traces will guide us.
+      // Unconditional branches do not have a safepoint.
+      // has_safepoint = 0
+      OutStreamer.emitInt8(0);
+      // We don't serialise the branch target for unconditional branches
+      // because traces will guide us.
       //
       // opcode:
       serialiseOpcode(OpCodeBr);
@@ -853,7 +868,19 @@ private:
       serialiseBlockLabel(I->getSuccessor(1));
 
       CallInst *SMI = dyn_cast<CallInst>(I->getPrevNonDebugInstruction());
-      serialiseStackmapCall(SMI, FLCtxt);
+      
+      llvm::errs() << "@@ serialiseBranchInst -> serialiseStackmapCall, " << I->getFunction()->getName() << "\n";
+      bool IsClonedFunction =
+          I->getFunction()->getName().startswith(YK_CLONE_PREFIX);
+
+      if (!IsClonedFunction) {
+            // has_safepoint = 1:
+            OutStreamer.emitInt8(1);
+            serialiseStackmapCall(SMI, FLCtxt);
+        } else {
+             // has_safepoint = 0
+            OutStreamer.emitInt8(0);
+        }
     }
     InstIdx++;
   }
@@ -865,11 +892,12 @@ private:
     //  - loads from exotic address spaces
     //  - potentially misaligned loads
     //
-    // FIXME: About misaligned loads, when a load is aligned `N`, this is a hard
-    // guarantee to the code generator that at runtime, the pointer is aligned
-    // to N bytes. The codegen uses this to decide whether or not to split the
-    // operation into multiple loads (in order to avoid a memory access
-    // straddling an alignment boundary on a CPU that disallows such things).
+    // FIXME: About misaligned loads, when a load is aligned `N`, this is a
+    // hard guarantee to the code generator that at runtime, the pointer is
+    // aligned to N bytes. The codegen uses this to decide whether or not to
+    // split the operation into multiple loads (in order to avoid a memory
+    // access straddling an alignment boundary on a CPU that disallows such
+    // things).
     //
     // For now we let through only loads with an alignment greater-than or
     // equal-to the size of the type of the data being loaded. Such cases are
@@ -906,8 +934,8 @@ private:
     //  - stores into exotic address spaces
     //  - potentially misaligned stores
     //
-    // See the comment in `serialiseLoadInst()` for context on misaligned memory
-    // accesses.
+    // See the comment in `serialiseLoadInst()` for context on misaligned
+    // memory accesses.
     if ((I->getOrdering() != AtomicOrdering::NotAtomic) ||
         (I->getPointerAddressSpace() != 0) ||
         (I->getAlign() <
@@ -958,15 +986,16 @@ private:
     //    elem_size`, where `elem_count` is not known statically.
     //
     // We encode this information into our Yk AOT `PtrAdd` instruction, but
-    // there are some semantics of LLVM's GEP that we have to be very careful to
-    // preserve. At the time of writing, these are the things that it's
+    // there are some semantics of LLVM's GEP that we have to be very careful
+    // to preserve. At the time of writing, these are the things that it's
     // important to know:
     //
     //  1. LLVM integer types are neither signed nor unsigned. They are a bit
     //     pattern that can be interpreted (by LLVM instructions) as a signed
     //     or unsigned integer.
     //
-    //  2. a dynamic index cannot be applied to a struct, because struct fields
+    //  2. a dynamic index cannot be applied to a struct, because struct
+    //  fields
     //     can have different types and you wouldn't be able to statically
     //     determine the type of the field being selected.
     //
@@ -978,13 +1007,14 @@ private:
     //     offsetting pointers.
     //
     //  5. Index operands to `getelementptr` can have arbitrary bit-width
-    //     (although struct indexing must use i32). Index types with a different
-    //     bit-width than the "pointer indexing type" for the address space in
-    //     question must be extended or truncated (and if it's a signed index,
-    //     then that's a sign extend!). To get the indexing type, you use
-    //     `DataLayout:getIndexSizeInBits()`.
+    //     (although struct indexing must use i32). Index types with a
+    //     different bit-width than the "pointer indexing type" for the
+    //     address space in question must be extended or truncated (and if
+    //     it's a signed index, then that's a sign extend!). To get the
+    //     indexing type, you use `DataLayout:getIndexSizeInBits()`.
     //
-    //  6. We can ignore the `inbounds` keyword on GEPs. When an `inbounds` GEP
+    //  6. We can ignore the `inbounds` keyword on GEPs. When an `inbounds`
+    //  GEP
     //     is out of bounds, a poison value is generated. Since a poison value
     //     represents (deferred) undefined behaviour (UB), we are free to
     //     compute any value we want, including the out of bounds offset.
@@ -1000,8 +1030,8 @@ private:
 
     APInt ConstOff(IdxBitWidth, 0);
     MapVector<Value *, APInt> DynOffs;
-    // Note: the width of the collected constant offset must be the same as the
-    // index type bit-width.
+    // Note: the width of the collected constant offset must be the same as
+    // the index type bit-width.
     bool CollectRes = I->collectOffset(DL, IdxBitWidth, DynOffs, ConstOff);
     assert(CollectRes);
 
@@ -1269,8 +1299,8 @@ private:
         serialiseUnimplementedInstruction(I, FLCtxt, BBIdx, InstIdx);
         return;
       }
-      // After excluding truncation from ptrtoint/inttoptr, it's just a zext in
-      // disguise.
+      // After excluding truncation from ptrtoint/inttoptr, it's just a zext
+      // in disguise.
       CK = CastKindZeroExt;
     }
     if (!CK.has_value() || (I->getOperand(0)->getType()->isVectorTy())) {
@@ -1312,9 +1342,15 @@ private:
     for (auto &Case : I->cases()) {
       serialiseBlockLabel(Case.getCaseSuccessor());
     }
-    // safepoint:
-    CallInst *SMI = dyn_cast<CallInst>(I->getPrevNonDebugInstruction());
-    serialiseStackmapCall(SMI, FLCtxt);
+    bool isClonedFunction = I->getFunction()->getName().startswith(YK_CLONE_PREFIX);
+    if (!isClonedFunction) {
+       llvm::errs() << "@@ serialiseSwitchInst -> serialiseStackmapCall, " << I->getFunction()->getName() << "\n";
+      // safepoint:
+      CallInst *SMI = dyn_cast<CallInst>(I->getPrevNonDebugInstruction());
+      serialiseStackmapCall(SMI, FLCtxt);
+    }else{
+      llvm::errs() << "@@ SKIP serialiseSwitchInst -> serialiseStackmapCall, " << I->getFunction()->getName() << "\n";
+    }
     InstIdx++;
   }
 
@@ -1394,9 +1430,9 @@ private:
       // Line numbers start at 1 and 0 seems to indicate an error state.
       if (LineNum != 0) {
         LineInfo LI = {PathIdx, LineNum};
-        // Multiple IR instructions could map to the same source line. To avoid
-        // unnecessary noise in the rendered AOT IR, we only add an entry when
-        // the line number changes.
+        // Multiple IR instructions could map to the same source line. To
+        // avoid unnecessary noise in the rendered AOT IR, we only add an
+        // entry when the line number changes.
         if (LI != LastLineInfo) {
           LineInfos.insert({Key, LI});
           LastLineInfo = LI;
@@ -1441,8 +1477,8 @@ private:
     INST_SERIALISE(I, SwitchInst, serialiseSwitchInst);
     INST_SERIALISE(I, SelectInst, serialiseSelectInst);
 
-    // INST_SERIALISE does an early return upon a match, so if we get here then
-    // the instruction wasn't handled.
+    // INST_SERIALISE does an early return upon a match, so if we get here
+    // then the instruction wasn't handled.
     serialiseUnimplementedInstruction(I, FLCtxt, BBIdx, InstIdx);
   }
 
@@ -1493,9 +1529,9 @@ private:
 
     // num_instrs:
     //
-    // We don't know how many instructions there will be in advance, so what we
-    // do is emit a placeholder field (in the form of a symbol value) which is
-    // patched up (assigned) later.
+    // We don't know how many instructions there will be in advance, so what
+    // we do is emit a placeholder field (in the form of a symbol value) which
+    // is patched up (assigned) later.
     MCContext &MCtxt = OutStreamer.getContext();
     MCSymbol *NumInstrsSym = MCtxt.createTempSymbol();
     OutStreamer.emitSymbolValue(NumInstrsSym, sizeof(size_t));
@@ -1504,9 +1540,9 @@ private:
     unsigned InstIdx = 0;
 
     // Insert LoadArg instructions for each argument of this function and
-    // replace all Argument operands with their respective LoadArg instruction.
-    // This ensures we won't have to deal with argument operands in the yk
-    // pipeline (e.g. trace_builder, deopt).
+    // replace all Argument operands with their respective LoadArg
+    // instruction. This ensures we won't have to deal with argument operands
+    // in the yk pipeline (e.g. trace_builder, deopt).
     if (BBIdx == 0) {
       for (Argument *Arg = F.arg_begin(); Arg != F.arg_end(); Arg++) {
         serialiseLoadArg(Arg);
@@ -1752,20 +1788,20 @@ public:
 
     // num_funcs:
     // Count non-cloned functions
-    unsigned numFuncs = 0;
-    for (const llvm::Function &F : M) {
-      if (!StringRef(F.getName()).startswith(YK_CLONE_PREFIX)) {
-        numFuncs++;
-      }
-    }
+    // unsigned numFuncs = 0;
+    // for (const llvm::Function &F : M) {
+    //   if (!StringRef(F.getName()).startswith(YK_CLONE_PREFIX)) {
+    //     numFuncs++;
+    //   }
+    // }
     // Emit the number of non-cloned functions
-    OutStreamer.emitSizeT(numFuncs);
+    OutStreamer.emitSizeT(M.size());
     // funcs:
     for (llvm::Function &F : M) {
       // Skip cloned functions
-      if (StringRef(F.getName()).startswith(YK_CLONE_PREFIX)) {
-        continue;
-      }
+      // if (StringRef(F.getName()).startswith(YK_CLONE_PREFIX)) {
+      //   continue;
+      // }
       serialiseFunc(F);
     }
 
@@ -1783,10 +1819,11 @@ public:
       serialiseGlobal(G);
     }
 
-    // Now that we've finished serialising globals, add a global (immutable, for
-    // now) array to the LLVM module containing pointers to all the global
-    // variables. We will use this to find the addresses of globals at runtime.
-    // The indices of the array correspond with `GlobalDeclIdx`s in the AOT IR.
+    // Now that we've finished serialising globals, add a global (immutable,
+    // for now) array to the LLVM module containing pointers to all the global
+    // variables. We will use this to find the addresses of globals at
+    // runtime. The indices of the array correspond with `GlobalDeclIdx`s in
+    // the AOT IR.
     vector<llvm::Constant *> GlobalsAsConsts;
     for (llvm::GlobalVariable *G : Globals) {
       GlobalsAsConsts.push_back(cast<llvm::Constant>(G));
@@ -1808,6 +1845,7 @@ public:
     serialisePaths();
     // line_info:
     serialiseLineInfo();
+    M.print(llvm::errs(), nullptr);
   }
 };
 } // anonymous namespace
