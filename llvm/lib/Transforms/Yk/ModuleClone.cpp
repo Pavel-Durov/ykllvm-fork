@@ -12,14 +12,14 @@
 //     and are not cloned.
 //
 // - **Cloned Function Naming:**
-//   - The cloned functions are renamed by adding the prefix `__yk_opt_` to
+//   - The cloned functions are renamed by adding the prefix `__yk_unopt_` to
 //     their original names. This distinguishes them from the original
 //     functions.
 //
 // - **Optimisation Intent:**
-//   - The **cloned functions** (those with the `__yk_opt_` prefix) are
-//     intended to be the **optimised versions** of the functions.
-//   - The **original functions** remain **unoptimised**.
+//   - The **cloned functions** (those with the `__yk_unopt_` prefix) are
+//     intended to be the **unoptimised versions** of the functions.
+//   - The **original functions** remain **optimised**.
 //
 //===----------------------------------------------------------------------===//
 
@@ -124,6 +124,47 @@ struct YkModuleClone : public ModulePass {
               auto It = ClonedFuncs.find(CalledName);
               if (It != ClonedFuncs.end()) {
                 Call->setCalledFunction(It->second);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * This function iterates over all functions in the `FinalModule`.
+   * If cloned function calls are identified within the original function
+   * instructions, they are redirected to the original function instead.
+   *
+   * **Example Scenario:**
+   * - Function `f` calls function `g`.
+   * - Function `g` is cloned as `__yk_clone_g`.
+   * - Function `f` is not cloned because its address is taken.
+   * - As a result, function `f` calls `__yk_clone_g` instead of `g`.
+   *
+   * **Reasoning:**
+   * In `YkIRWriter` we only serialise non-cloned functions.
+   *
+   * @param FinalModule The module containing both original and cloned
+   * functions.
+   */
+  void updateFunctionCalls(Module &FinalModule) {
+    for (Function &F : FinalModule) {
+      if (F.getName().startswith(YK_CLONE_PREFIX)) {
+        continue;
+      }
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+            Function *CalledFunc = CI->getCalledFunction();
+            if (CalledFunc &&
+                CalledFunc->getName().startswith(YK_CLONE_PREFIX)) {
+              std::string OriginalName =
+                  CalledFunc->getName().str().substr(strlen(YK_CLONE_PREFIX));
+              Function *OriginalFunc = FinalModule.getFunction(OriginalName);
+              if (OriginalFunc) {
+                CI->setCalledFunction(OriginalFunc);
               }
             }
           }
