@@ -90,12 +90,33 @@ void killRegister(const Register DwReg, std::map<Register, std::set<int64_t>> &S
     clearRhs(DwReg, SpillMap);
 }
 
+/// Go up the super-register chain until we hit a valid dwarf register number.
+///
+/// This is fallible verion of getDwarfRegNum() from Stackmaps.cpp. Returns < 0
+/// if the register has no DWARF number.
+int getDwarfRegNumFallible(unsigned Reg, const TargetRegisterInfo *TRI) {
+  int RegNum;
+  for (MCPhysReg SR : TRI->superregs_inclusive(Reg)) {
+    RegNum = TRI->getDwarfRegNum(SR, false);
+    if (RegNum >= 0)
+      break;
+  }
+  // In Stackmaps.cpp there was an assertion here checking RegNum >= 0 and the
+  // return value was casted unsigned.
+  return RegNum;
+}
+
 /// Given a MachineBasicBlock, analyse its instructions to build a mapping of
 /// where duplicate values live. This can be either in another register or on
 /// the stack. Since registers are always positive and stack offsets negative,
 /// we can store both in the same map while still being able to distinguish
 /// them. This allows us to keep the changes in Stackmaps.cpp to a minimum and
 /// avoids having to alter the stackmap format.
+///
+/// FIXME: the algorithm is implemented with hashmaps which makes it more
+/// complicated than it needs to be. We think this would be better implemented
+/// using union find to store disjoint sets of "alised" locations.
+/// https://github.com/ykjit/yk/issues/1602
 void processInstructions(
     const MachineBasicBlock *MBB,
     std::map<Register, std::set<int64_t>> &SpillMap,
@@ -174,6 +195,12 @@ void processInstructions(
         // the register. We do, however, now need to remove all previous
         // mappings to this offset (unless the other mapping contains `DwReg`).
         clearOffset(DwReg, Offset, SpillMap);
+        for (int64_t Rhs : SpillMap[DwReg]) {
+          // Apply offset transitively to the other mappings.
+          if (Rhs >= 0) {
+            SpillMap[Rhs].insert(Offset);
+          }
+        }
         SpillMap[DwReg].insert(Offset);
       }
       // YKOPT: we can also remove killed registers, if any.
@@ -203,10 +230,14 @@ void processInstructions(
     // return value in RAX).
     for (const MachineOperand MO : Instr.all_defs()) {
       assert(MO.isReg() && "Is register.");
-      if (MO.getReg() == X86::SSP) {
+      int DwReg = getDwarfRegNumFallible(MO.getReg(), TRI);
+      if (DwReg < 0) {
+        // DWARF doesn't assign this register a number. This happens for
+        // some niche registers like DF, SSP, FPSW. If we are required to
+        // restore these for correct deopt then we are out of luck: stackmaps
+        // speak DWARF, but these registers have no DWARF number. Eek!
         continue;
       }
-      auto DwReg = getDwarfRegNum(MO.getReg(), TRI);
       killRegister(DwReg, SpillMap);
     }
 
@@ -217,7 +248,7 @@ void processInstructions(
     // YKOPT: use `all_uses()` to kill implicit uses too?
     for (const MachineOperand MO : Instr.uses()) {
       if (MO.isReg() && (MO.isKill() || MO.isDef())) {
-        int DwReg = MRI->getDwarfRegNum(MO.getReg(), false);
+        int DwReg = getDwarfRegNumFallible(MO.getReg(), TRI);
         if (DwReg >= 0) {
           killRegister(DwReg, SpillMap);
         }
