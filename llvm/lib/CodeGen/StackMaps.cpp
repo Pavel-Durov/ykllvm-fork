@@ -665,7 +665,6 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                                const MachineInstr &MI,
                                std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::STACKMAP && "expected stackmap");
-
   StackMapOpers opers(&MI);
   const int64_t ID = MI.getOperand(PatchPointOpers::IDPos).getImm();
   recordStackMapOpers(L, MI, ID,
@@ -673,13 +672,13 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                       MI.operands_end(), SpillOffsets);
 }
 
-void StackMaps::recordPatchPoint(const MCSymbol &L, const MachineInstr &MI) {
+void StackMaps::recordPatchPoint(const MCSymbol &L, const MachineInstr &MI, std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::PATCHPOINT && "expected patchpoint");
 
   PatchPointOpers opers(&MI);
   const int64_t ID = opers.getID();
   auto MOI = std::next(MI.operands_begin(), opers.getStackMapStartIdx());
-  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), {},
+  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), SpillOffsets,
                       opers.isAnyReg() && opers.hasDef());
 
 #ifndef NDEBUG
