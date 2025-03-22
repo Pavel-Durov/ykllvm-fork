@@ -251,6 +251,20 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
       assert(Size > 0 && "Need a valid size for indirect memory locations.");
       Register Reg = (++MOI)->getReg();
       int64_t Imm = (++MOI)->getImm();
+      // Check if this indirect location aliases with a register. If so track
+      // the register instead alongside any extra locations attached to that
+      // register (by definition this indirect will be included in those extra
+      // locations).
+      for (auto [TrackReg, Extras]: SpillOffsets) {
+        for (auto E : Extras) {
+          if (E == Imm) {
+            const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(Reg);
+            Locs.emplace_back(Location::Register, TRI->getSpillSize(*RC), TrackReg,
+                              0, Extras);
+            return ++MOI;
+          }
+        }
+      }
       Locs.emplace_back(StackMaps::Location::Indirect, Size,
                         getDwarfRegNum(Reg, TRI), Imm);
       break;
@@ -672,7 +686,9 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                       MI.operands_end(), SpillOffsets);
 }
 
-void StackMaps::recordPatchPoint(const MCSymbol &L, const MachineInstr &MI, std::map<Register, std::set<int64_t>> SpillOffsets) {
+void StackMaps::recordPatchPoint(
+    const MCSymbol &L, const MachineInstr &MI,
+    std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::PATCHPOINT && "expected patchpoint");
 
   PatchPointOpers opers(&MI);
