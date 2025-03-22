@@ -686,9 +686,7 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                       MI.operands_end(), SpillOffsets);
 }
 
-void StackMaps::recordPatchPoint(
-    const MCSymbol &L, const MachineInstr &MI,
-    std::map<Register, std::set<int64_t>> SpillOffsets) {
+void StackMaps::recordPatchPoint(const MCSymbol &L, const MachineInstr &MI, std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::PATCHPOINT && "expected patchpoint");
 
   PatchPointOpers opers(&MI);
