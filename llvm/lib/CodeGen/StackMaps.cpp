@@ -578,6 +578,14 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
                                     MachineInstr::const_mop_iterator MOE,
                                     std::map<Register, std::set<int64_t>> SpillOffsets,
                                     bool recordResult) {
+  if (::getenv("CP_PRINT_MACHINE_CODE")) {
+    dbgs() << "********** Machine Code when processing stackmap **********\n";
+    if (AP.MF) {
+      dbgs() << "Function: " << AP.MF->getName() << "\n";
+      AP.MF->print(dbgs());
+    }
+    dbgs() << "********** End of Machine Code **********\n";
+  }
   MCContext &OutContext = AP.OutStreamer->getContext();
 
   LiveVarsVec LiveVars = {LocationVec()};
@@ -679,7 +687,6 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                                const MachineInstr &MI,
                                std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::STACKMAP && "expected stackmap");
-
   StackMapOpers opers(&MI);
   const int64_t ID = MI.getOperand(PatchPointOpers::IDPos).getImm();
   recordStackMapOpers(L, MI, ID,
@@ -687,15 +694,13 @@ void StackMaps::recordStackMap(const MCSymbol &L,
                       MI.operands_end(), SpillOffsets);
 }
 
-void StackMaps::recordPatchPoint(
-    const MCSymbol &L, const MachineInstr &MI,
-    std::map<Register, std::set<int64_t>> SpillOffsets) {
+void StackMaps::recordPatchPoint(const MCSymbol &L, const MachineInstr &MI, std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::PATCHPOINT && "expected patchpoint");
 
   PatchPointOpers opers(&MI);
   const int64_t ID = opers.getID();
   auto MOI = std::next(MI.operands_begin(), opers.getStackMapStartIdx());
-  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), {},
+  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), SpillOffsets,
                       opers.isAnyReg() && opers.hasDef());
 
 #ifndef NDEBUG
