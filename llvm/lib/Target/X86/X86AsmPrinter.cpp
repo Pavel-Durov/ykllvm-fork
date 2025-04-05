@@ -106,6 +106,42 @@ int getDwarfRegNumFallible(unsigned Reg, const TargetRegisterInfo *TRI) {
   return RegNum;
 }
 
+// Helper function to safely get register names
+static std::string getRegisterNameSafe(int64_t RegNo) {
+ if (RegNo == X86::DF) {
+    return "DF";
+  }
+  if (RegNo > 0 && RegNo < 292) {
+    return X86ATTInstPrinter::getRegisterName(RegNo);
+  } else if (RegNo < 0) {
+    // Negative values represent stack offsets in the SpillMap
+    return "stack[" + std::to_string(-RegNo) + "]";
+  } else {
+    // For DWARF register numbers
+    switch (RegNo) {
+      case 0: return "rax";
+      case 1: return "rdx";
+      case 2: return "rcx";
+      case 3: return "rbx";
+      case 4: return "rsi";
+      case 5: return "rdi";
+      case 6: return "rbp";
+      case 7: return "rsp";
+      case 8: return "r8";
+      case 9: return "r9";
+      case 10: return "r10";
+      case 11: return "r11";
+      case 12: return "r12";
+      case 13: return "r13";
+      case 14: return "r14";
+      case 15: return "r15";
+      // case 16: return "ra";
+      // Add more DWARF register mappings as needed
+      default: return "reg#" + std::to_string(RegNo);
+    }
+  }
+}
+
 /// Given a MachineBasicBlock, analyse its instructions to build a mapping of
 /// where duplicate values live. This can be either in another register or on
 /// the stack. Since registers are always positive and stack offsets negative,
@@ -166,7 +202,6 @@ void processInstructions(
       }
       continue;
     }
-
     int FI;
     // A value from a register was spilled to the stack. Create a mapping from
     // that register to the stack offset.
@@ -325,7 +360,6 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   TRI = MF.getSubtarget().getRegisterInfo();
   MRI = TM.getMCRegisterInfo();
   Subtarget = &MF.getSubtarget<X86Subtarget>();
-
   SMShadowTracker.startFunction(MF);
   CodeEmitter.reset(TM.getTarget().createMCCodeEmitter(
       *Subtarget->getInstrInfo(), MF.getContext()));
@@ -366,7 +400,6 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   EmitFPOData = false;
 
   IndCSPrefix = false;
-
   // We didn't modify anything.
   return false;
 }
