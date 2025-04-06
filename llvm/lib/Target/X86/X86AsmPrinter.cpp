@@ -61,50 +61,6 @@ X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
 // Primitive Helper Functions.
 //===----------------------------------------------------------------------===//
 
-const TargetInstrInfo *TII;
-const TargetRegisterInfo *TRI;
-const MCRegisterInfo *MRI;
-
-/// Clear any mappings that map to the given register.
-void clearRhs(Register Reg, std::map<Register, std::set<int64_t>> &SpillMap) {
-  auto I = SpillMap.begin();
-  while (I != SpillMap.end()) {
-    I->second.erase(Reg);
-    ++I;
-  }
-}
-
-void clearOffset(unsigned int Reg, int Offset, std::map<Register, std::set<int64_t>> &SpillMap) {
-  auto I = SpillMap.begin();
-  while (I != SpillMap.end()) {
-    if (I->second.count(Reg) == 0) {
-      I->second.erase(Offset);
-    }
-    ++I;
-  }
-}
-
-/// Remove all mentions of the DWARF register `DwReg` from `SpillMap`.
-void killRegister(const Register DwReg, std::map<Register, std::set<int64_t>> &SpillMap) {
-    SpillMap.erase(DwReg);
-    clearRhs(DwReg, SpillMap);
-}
-
-/// Go up the super-register chain until we hit a valid dwarf register number.
-///
-/// This is fallible verion of getDwarfRegNum() from Stackmaps.cpp. Returns < 0
-/// if the register has no DWARF number.
-int getDwarfRegNumFallible(unsigned Reg, const TargetRegisterInfo *TRI) {
-  int RegNum;
-  for (MCPhysReg SR : TRI->superregs_inclusive(Reg)) {
-    RegNum = TRI->getDwarfRegNum(SR, false);
-    if (RegNum >= 0)
-      break;
-  }
-  // In Stackmaps.cpp there was an assertion here checking RegNum >= 0 and the
-  // return value was casted unsigned.
-  return RegNum;
-}
 
 // Helper function to safely get register names
 static std::string getRegisterNameSafe(int64_t RegNo) {
@@ -142,6 +98,60 @@ static std::string getRegisterNameSafe(int64_t RegNo) {
   }
 }
 
+
+const TargetInstrInfo *TII;
+const TargetRegisterInfo *TRI;
+const MCRegisterInfo *MRI;
+
+/// Clear any mappings that map to the given register.
+void clearRhs(Register Reg, std::map<Register, std::set<int64_t>> &SpillMap) {
+  auto I = SpillMap.begin();
+  while (I != SpillMap.end()) {
+    I->second.erase(Reg);
+    ++I;
+  }
+}
+
+void clearOffset(unsigned int Reg, int Offset, std::map<Register, std::set<int64_t>> &SpillMap) {
+  auto I = SpillMap.begin();
+  while (I != SpillMap.end()) {
+    if (I->second.count(Reg) == 0) {
+      I->second.erase(Offset);
+    }
+    ++I;
+  }
+}
+
+/// Remove all mentions of the DWARF register `DwReg` from `SpillMap`.
+void killRegister(const Register DwReg, std::map<Register, std::set<int64_t>> &SpillMap) {
+    // if (DwReg == 0) {
+    //    std::set<int64_t> Other = SpillMap[DwReg];
+    //    dbgs() << "[YK_DEBUG] KILLING REGISTER 0 " << getRegisterNameSafe(DwReg) << ", locs: ";
+    //    for (auto loc : Other) {
+    //     dbgs() << getRegisterNameSafe(loc) << " ";
+    //    }
+    //    dbgs() << "\n";
+    // }
+    SpillMap.erase(DwReg);
+    clearRhs(DwReg, SpillMap);
+}
+
+/// Go up the super-register chain until we hit a valid dwarf register number.
+///
+/// This is fallible verion of getDwarfRegNum() from Stackmaps.cpp. Returns < 0
+/// if the register has no DWARF number.
+int getDwarfRegNumFallible(unsigned Reg, const TargetRegisterInfo *TRI) {
+  int RegNum;
+  for (MCPhysReg SR : TRI->superregs_inclusive(Reg)) {
+    RegNum = TRI->getDwarfRegNum(SR, false);
+    if (RegNum >= 0)
+      break;
+  }
+  // In Stackmaps.cpp there was an assertion here checking RegNum >= 0 and the
+  // return value was casted unsigned.
+  return RegNum;
+}
+
 /// Given a MachineBasicBlock, analyse its instructions to build a mapping of
 /// where duplicate values live. This can be either in another register or on
 /// the stack. Since registers are always positive and stack offsets negative,
@@ -156,12 +166,11 @@ static std::string getRegisterNameSafe(int64_t RegNo) {
 void processInstructions(
     const MachineBasicBlock *MBB,
     std::map<Register, std::set<int64_t>> &SpillMap,
-    std::map<const MachineInstr *, std::map<Register, std::set<int64_t>>> &StackmapSpillMaps
-  ) {
+    std::map<const MachineInstr *, std::map<Register, std::set<int64_t>>> &StackmapSpillMaps,
+    std::set<int> &RegistersInPatchpoints
+    ) {
   for (const MachineInstr &Instr : MBB->instrs()) {
-    // At each stackmap call, save the current mapping so it can later be
-    // encoded in the stackmap when it is lowered.
-    if (Instr.getOpcode() == TargetOpcode::STACKMAP || Instr.getOpcode() == TargetOpcode::PATCHPOINT) {
+     if (Instr.getOpcode() == TargetOpcode::STACKMAP) {
       StackmapSpillMaps[&Instr] = SpillMap;
       for (const MachineOperand MO : Instr.uses()) {
         if (MO.isReg() && MO.isKill()) {
@@ -171,6 +180,25 @@ void processInstructions(
       }
       continue;
     }
+
+    if (Instr.getOpcode() == TargetOpcode::PATCHPOINT) {
+      StackmapSpillMaps[&Instr] = SpillMap;
+      for (const MachineOperand MO : Instr.uses()) {
+        if (MO.isReg()) {
+          int DwReg = getDwarfRegNumFallible(MO.getReg(), TRI);
+          std::set<int64_t> Others = SpillMap[DwReg];
+          RegistersInPatchpoints.insert(DwReg);
+          for (auto loc : Others) {
+            // Only add register locations, not stack offsets
+            if (loc >= 0) {
+              RegistersInPatchpoints.insert(loc);
+            }
+          }
+        }
+      }
+      continue;
+    }
+
 
     // Copying a value from one register B to another A, creates a mapping from
     // A to B. If A is tracked by the stackmap, then B will also be tracked and
@@ -198,7 +226,13 @@ void processInstructions(
       // Also add Lhs to the mapping of Rhs.
       SpillMap[RhsDwReg].insert(LhsDwReg);
       if (Rhs.isKill()) {
-        killRegister(RhsDwReg, SpillMap);
+        if (::getenv("CP_PATCHPOINT") == "1") {
+          if (RegistersInPatchpoints.count((int64_t)RhsDwReg) == 0){  
+            killRegister(RhsDwReg, SpillMap);
+          }
+        } else {
+          killRegister(RhsDwReg, SpillMap);
+        }
       }
       continue;
     }
@@ -260,7 +294,13 @@ void processInstructions(
         // speak DWARF, but these registers have no DWARF number. Eek!
         continue;
       }
-      killRegister(DwReg, SpillMap);
+       if (::getenv("CP_PATCHPOINT") == "1") {
+          if (RegistersInPatchpoints.count((int64_t)DwReg) == 0){  
+            killRegister(DwReg, SpillMap);
+          }
+        } else {
+          killRegister(DwReg, SpillMap);
+        }
     }
 
     // Delete registers that are "killed" (no longer live) after this
@@ -272,7 +312,13 @@ void processInstructions(
       if (MO.isReg() && (MO.isKill() || MO.isDef())) {
         int DwReg = getDwarfRegNumFallible(MO.getReg(), TRI);
         if (DwReg >= 0) {
-          killRegister(DwReg, SpillMap);
+          if (::getenv("CP_PATCHPOINT") == "1") {
+            if (RegistersInPatchpoints.count((int64_t)DwReg) == 0){  
+              killRegister(DwReg, SpillMap);
+            }
+          } else {
+            killRegister(DwReg, SpillMap);
+          }
         }
       }
     }
@@ -309,7 +355,8 @@ void findSpillLocations(
     const MachineBasicBlock *MBB,
     std::map<const MachineBasicBlock *, std::map<Register, std::set<int64_t>>> &MBSpillMaps,
     std::map<Register, std::set<int64_t>> SpillMap,
-    std::map<const MachineInstr *, std::map<Register, std::set<int64_t>>> &StackmapSpillMaps
+    std::map<const MachineInstr *, std::map<Register, std::set<int64_t>>> &StackmapSpillMaps,
+    std::set<int> &RegistersInPatchpoints
     ) {
 
   int Changed = false;
@@ -347,9 +394,9 @@ void findSpillLocations(
   // Remember this blocks spillmap.
   MBSpillMaps[MBB] = SpillMap;
   if (Changed) {
-    processInstructions(MBB, SpillMap, StackmapSpillMaps);
+    processInstructions(MBB, SpillMap, StackmapSpillMaps, RegistersInPatchpoints);
     for (MachineBasicBlock *Succ : MBB->successors()) {
-      findSpillLocations(Succ, MBSpillMaps, SpillMap, StackmapSpillMaps);
+      findSpillLocations(Succ, MBSpillMaps, SpillMap, StackmapSpillMaps, RegistersInPatchpoints);
     }
   }
 }
@@ -387,8 +434,9 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   TII = MF.getSubtarget().getInstrInfo();
   std::map<Register, std::set<int64_t>> SpillMap;
   std::map<const MachineBasicBlock *, std::map<Register, std::set<int64_t>>> MBSpillMaps;
+  std::set<int> RegistersInPatchpoints;
   if (YkStackMapAdditionalLocs) {
-    findSpillLocations(&*MF.begin(), MBSpillMaps, SpillMap, StackmapSpillMaps);
+    findSpillLocations(&*MF.begin(), MBSpillMaps, SpillMap, StackmapSpillMaps, RegistersInPatchpoints);
   }
 
   // Emit the rest of the function body.

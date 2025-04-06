@@ -227,7 +227,8 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
                         MachineInstr::const_mop_iterator MOE,
                         LiveVarsVec &LiveVars, LiveOutVec &LiveOuts,
                         std::map<Register, std::set<int64_t>> SpillOffsets,
-                        std::set<int64_t> TrackedRegisters) const {
+                        std::set<int64_t> TrackedRegisters,
+                        const MachineInstr *InstrMI) const {
   LocationVec &Locs = LiveVars.back();
   const TargetRegisterInfo *TRI = AP.MF->getSubtarget().getRegisterInfo();
   if (MOI->isImm()) {
@@ -326,15 +327,19 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
     if (MOI->isReg()) {
       if (SpillOffsets.count(DwarfRegNum) > 0) {
         Extras = SpillOffsets[DwarfRegNum];
-        // Remove redundant registers/offsets that are already tracked by the
-        // stackmap or by another tracked register.
-        for (auto TReg : TrackedRegisters) {
-          if (TReg == DwarfRegNum) {
-            continue;
-          }
-          Extras.erase(TReg);
-          for (auto X : SpillOffsets[TReg]) {
-            Extras.erase(X);
+        bool skipPatchpoint = false;
+        if (::getenv("CP_PATCHPOINT")== "1") {
+          skipPatchpoint = InstrMI && InstrMI->getOpcode() == TargetOpcode::PATCHPOINT;
+        }
+        if (skipPatchpoint){
+          for (auto TReg : TrackedRegisters) {
+            if (TReg == DwarfRegNum) {
+              continue;
+            }
+            Extras.erase(TReg);
+            for (auto X : SpillOffsets[TReg]) {
+              Extras.erase(X);
+            }
           }
         }
       }
@@ -491,9 +496,9 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   LLVM_DEBUG(dbgs() << "record statepoint : " << MI << "\n");
   StatepointOpers SO(&MI);
 
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // CC
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // Flags
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // Num Deopts
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // CC
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // Flags
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // Num Deopts
 
   // Record Deopt Args.
   unsigned NumDeoptArgs = LiveVars.back().back().Offset;
@@ -506,7 +511,7 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   while (NumDeoptArgs) {
     if (StackMaps::isNextLive(*MOI))
       NumDeoptArgs--;
-    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts);
+    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI);
   }
 
   // Record gc base/derived pairs
@@ -550,9 +555,9 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
       unsigned DerivedIdx = GCPtrIndices[P.second];
       LLVM_DEBUG(dbgs() << "Base : " << BaseIdx << " Derived : " << DerivedIdx
                         << "\n");
-      (void)parseOperand(MOB + BaseIdx, MOE, LiveVars, LiveOuts);
+      (void)parseOperand(MOB + BaseIdx, MOE, LiveVars, LiveOuts, {}, {}, &MI);
       LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
-      (void)parseOperand(MOB + DerivedIdx, MOE, LiveVars, LiveOuts);
+      (void)parseOperand(MOB + DerivedIdx, MOE, LiveVars, LiveOuts, {}, {}, &MI);
       LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
     }
 
@@ -566,7 +571,7 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   unsigned NumAllocas = MOI->getImm();
   ++MOI;
   while (NumAllocas--) {
-    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts);
+    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI);
     LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
     assert(MOI < MOE);
   }
@@ -594,7 +599,7 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
   if (recordResult) {
     assert(PatchPointOpers(&MI).hasDef() && "Stackmap has no return value.");
     parseOperand(MI.operands_begin(), std::next(MI.operands_begin()), LiveVars,
-                 LiveOuts, SpillOffsets);
+                 LiveOuts, SpillOffsets, {}, &MI);
     LiveVars.push_back(LocationVec());
   }
 
@@ -611,7 +616,7 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
     parseStatepointOpers(MI, MOI, MOE, LiveVars, LiveOuts);
   else
     while (MOI != MOE)
-      MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, SpillOffsets, TrackedRegisters);
+      MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, SpillOffsets, TrackedRegisters, &MI);
 
   // Move large constants into the constant pool.
   for (auto &Locations : LiveVars) {
