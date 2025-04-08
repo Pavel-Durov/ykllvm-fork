@@ -346,6 +346,7 @@ void initializeYkSplitBlocksAfterCallsPass(PassRegistry&);
 void initializeYkBasicBlockTracerPass(PassRegistry&);
 void initializeYkShadowStackPass(PassRegistry&);
 void initializeYkModuleClonePass(PassRegistry&);
+void initializeYkBasicBlockTracerNoopPass(PassRegistry&);
 } // end namespace llvm
 
 #endif // LLVM_INITIALIZEPASSES_H
