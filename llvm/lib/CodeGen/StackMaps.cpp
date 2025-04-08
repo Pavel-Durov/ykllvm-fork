@@ -327,20 +327,26 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
     if (MOI->isReg()) {
       if (SpillOffsets.count(DwarfRegNum) > 0) {
         Extras = SpillOffsets[DwarfRegNum];
-        bool skipPatchpoint = false;
-        if (::getenv("CP_PATCHPOINT")== "1") {
-          skipPatchpoint = InstrMI && InstrMI->getOpcode() == TargetOpcode::PATCHPOINT;
+        bool killPatchpointVars = true;
+        const char* patchpointValue = ::getenv("CP_PATCHPOINT");
+        if (patchpointValue && strcmp(patchpointValue, "1") == 0) {
+          // Set killPatchpointVars to false if we're dealing with a patchpoint
+          // instruction.
+          killPatchpointVars = !(InstrMI && InstrMI->getOpcode() == TargetOpcode::PATCHPOINT);
         }
-        if (skipPatchpoint){
           for (auto TReg : TrackedRegisters) {
             if (TReg == DwarfRegNum) {
               continue;
             }
             Extras.erase(TReg);
             for (auto X : SpillOffsets[TReg]) {
-              Extras.erase(X);
+              if (killPatchpointVars) {
+                Extras.erase(X);
+              }
+              if (!killPatchpointVars && X > 0) {
+                Extras.erase(X);
+              }
             }
-          }
         }
       }
     }
