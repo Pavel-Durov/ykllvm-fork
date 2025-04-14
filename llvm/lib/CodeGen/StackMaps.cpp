@@ -870,7 +870,12 @@ void StackMaps::emitCallsiteEntries(MCStreamer &OS) {
       }
       OS.emitIntValue(LiveVar.size(), 1); // Num locations for the live var.
 
+      const char* printMachineCode = ::getenv("CP_VERBOSE");
+      auto CpLogs = strcmp(printMachineCode, "1") == 0;
       for (const auto &Loc : LiveVar) {
+        if (CpLogs && CSI.ID == 0 ||  CSI.ID ==1) {
+          dbgs() << "CSI.ID: " << CSI.ID << ", type:" << Loc.Type << ", size: " << Loc.Size << ", reg: " << Loc.Reg << ", offset: " << Loc.Offset << "\n";
+        }
         OS.emitIntValue(Loc.Type, 1);
         OS.emitIntValue(0, 1); // Reserved
         OS.emitInt16(Loc.Size);
@@ -879,6 +884,9 @@ void StackMaps::emitCallsiteEntries(MCStreamer &OS) {
         if (YkStackMapAdditionalLocs) {
           OS.emitInt16(Loc.Extras.size());
           for (int64_t Extra : Loc.Extras) {
+            if (CpLogs && CSI.ID == 0 ||  CSI.ID ==1) {
+              dbgs() << "CSI.ID: " << CSI.ID << ", Extra: " << Extra << "\n";
+            }
             OS.emitInt16(Extra);
           }
         }
