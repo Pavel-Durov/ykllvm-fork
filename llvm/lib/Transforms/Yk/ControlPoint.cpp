@@ -239,13 +239,24 @@ ModulePass *llvm::createYkControlPointPass(uint64_t controlPointCount) {
   return new YkControlPoint(controlPointCount);
 }
 
-// Returns true iff the function contains a (patched) control point.
+// Returns true iff the function contains a (patched or unpatched) control
+// point.
 bool llvm::containsControlPoint(llvm::Function &F) {
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (CallBase *CI = dyn_cast<CallBase>(&I)) {
         Function *CF = CI->getCalledFunction();
+        // Is it the patched control point?
         if ((CF != nullptr) && (CF->getName() == CP_PPNAME)) {
+          Value *PPTgt = CI->getArgOperand(PP_TARGET_OPND_IDX);
+          if (Function *Tgt = dyn_cast<Function>(PPTgt)) {
+            if (Tgt->getName() == YK_NEW_CONTROL_POINT) {
+              return true;
+            }
+          }
+        }
+        // Is it the unpatched control point?
+        if ((CF != nullptr) && (CF->getName() == YK_DUMMY_CONTROL_POINT)) {
           return true;
         }
       }
