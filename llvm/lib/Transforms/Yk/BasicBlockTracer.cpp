@@ -50,16 +50,22 @@ struct YkBasicBlockTracer : public ModulePass {
       for (auto &BB : F) {
         builder.SetInsertPoint(&*BB.getFirstInsertionPt());
 
-        if (F.getName().startswith(YK_UNOPT_PREFIX)) {
-          // Add dummy tracing calls to unoptimised functions
-          // TODO: These calls are redundantm we can simplery remove them
+        // Check if function is address-taken by looking at its metadata
+        bool isUnopt = F.getName().startswith(YK_UNOPT_PREFIX);
+        bool isAddrTaken = F.getMetadata(YK_FUNC_ADDR_TAKEN_MD_NAME) != nullptr;
+
+        if (isAddrTaken || isUnopt) {
+          // For address-taken functions or unoptimised functions, we need
+          // tracing always (because they're not duplicated but can be called
+          // while tracing)
           builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
                                          builder.getInt32(BlockIndex)});
         } else {
-          // Add tracing calls to unoptimised functions
+          // Add dummy tracing calls to optimised functions
           builder.CreateCall(DummyTraceFunc, {builder.getInt32(FunctionIndex),
                                               builder.getInt32(BlockIndex)});
         }
+
         assert(BlockIndex != UINT32_MAX &&
                "Expected BlockIndex to not overflow");
         BlockIndex++;
@@ -70,10 +76,10 @@ struct YkBasicBlockTracer : public ModulePass {
     }
     return true;
   }
-   void getAnalysisUsage(AnalysisUsage &AU) const override {
-      // AU.setPreservesCFG();
-      AU.setPreservesAll(); //if appropriate
-    }
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    // AU.setPreservesCFG();
+    AU.setPreservesAll(); // if appropriate
+  }
 };
 } // namespace
 

@@ -588,6 +588,15 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
                                     MachineInstr::const_mop_iterator MOE,
                                     std::map<Register, std::set<int64_t>> SpillOffsets,
                                     bool recordResult) {
+  const char* printMachineCode = ::getenv("CP_PRINT_MACHINE_CODE");
+  if (printMachineCode && strcmp(printMachineCode, "1") == 0) {
+    dbgs() << "********** Machine Code when processing stackmap **********\n";
+    if (AP.MF) {
+      dbgs() << "Function: " << AP.MF->getName() << "\n";
+      AP.MF->print(dbgs());
+    }
+    dbgs() << "********** End of Machine Code **********\n";
+  }
   MCContext &OutContext = AP.OutStreamer->getContext();
 
   LiveVarsVec LiveVars = {LocationVec()};
