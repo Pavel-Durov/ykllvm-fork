@@ -324,6 +324,7 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
     Register R = MOI->getReg();
     Register DwarfRegNum = getDwarfRegNum(R, TRI);
     std::set<int64_t> Extras;
+
     if (MOI->isReg()) {
       if (SpillOffsets.count(DwarfRegNum) > 0) {
         Extras = SpillOffsets[DwarfRegNum];
@@ -332,7 +333,6 @@ StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
         if (patchpointValue && strcmp(patchpointValue, "1") == 0 && InstrMI && InstrMI->getOpcode() == TargetOpcode::PATCHPOINT) {
           // Set killPatchpointVars to false if we're dealing with a patchpoint instruction.
           killPatchpointVars = false;
-          dbgs() << "CP_PATCHPOINT killPatchpointVars: " << killPatchpointVars << "\n";
         }
         for (auto TReg : TrackedRegisters) {
           if (TReg == DwarfRegNum) {
@@ -714,8 +714,7 @@ void StackMaps::recordPatchPoint(
   PatchPointOpers opers(&MI);
   const int64_t ID = opers.getID();
   auto MOI = std::next(MI.operands_begin(), opers.getStackMapStartIdx());
-  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), {},
-                      opers.isAnyReg() && opers.hasDef());
+  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), SpillOffsets, opers.isAnyReg() && opers.hasDef());
 
 #ifndef NDEBUG
   // verify anyregcc
