@@ -57,6 +57,12 @@ public:
     for (Function &F : M) {
       if (F.empty()) // skip declarations.
         continue;
+      // TODO: Why are we skipping cloned functions?
+      // if (F.getName().startswith(YK_UNOPT_PREFIX)) // skip cloned functions
+      //   continue;
+      if (F.hasFnAttribute("yk_outline") && !(containsControlPoint(F))) {
+        continue;
+      }
 
       LivenessAnalysis LA(&F);
       for (BasicBlock &BB : F) {
