@@ -9,6 +9,7 @@ add_llvm_component_library(LLVMYkPasses
   NoCallsInEntryBlocks.cpp
   SplitBlocksAfterCalls.cpp
   BasicBlockTracer.cpp
+  BasicBlockTracerNoop.cpp
   ModuleClone.cpp
 
   DEPENDS
