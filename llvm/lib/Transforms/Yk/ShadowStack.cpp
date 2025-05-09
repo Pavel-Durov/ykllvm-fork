@@ -83,7 +83,9 @@
 
 #include "llvm/Transforms/Yk/ShadowStack.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -101,6 +103,8 @@
 #define DEBUG_TYPE "yk-shadow-stack-pass"
 #define YK_MT_NEW "yk_mt_new"
 #define G_SHADOW_STACK "shadowstack_0"
+#define G_SHADOW_HEAD "shadowstack_head"
+#define G_SHADOW_SIZE "shadowstack_size"
 #define MAIN "main"
 // The size of the shadow stack. Defaults to 1MB.
 // YKFIXME: Make this adjustable by a compiler flag.
@@ -120,6 +124,11 @@ class YkShadowStackImpl {
   Type *Int8PtrTy = nullptr;
   Type *Int32Ty = nullptr;
   Type *PointerSizedIntTy = nullptr;
+  std::unique_ptr<DIBuilder> DIB;
+
+  GlobalVariable *ShadowCurrent;
+  GlobalVariable *ShadowHead;
+
   using AllocaVector = std::vector<std::pair<AllocaInst *, size_t>>;
 
 private:
@@ -147,6 +156,39 @@ public:
     return false;
   }
 
+  // Insert a shadowstack_ptr debug variable when compiled with '-g' so that in
+  // gdb we can know the offset into the shadow stack for each frame. This uses
+  // llvm's debug intrinsic so does not affect optimized code.
+  void insertShadowDbgInfo(Function &F, DataLayout &DL, size_t SFrameSize) {
+    DISubprogram *SP = F.getSubprogram();
+    if (!SP) {
+      return;
+    }
+    DIBasicType *DISSTy = DIB->createBasicType("shadowstack", SFrameSize * 8,
+                                               dwarf::DW_ATE_address);
+    DIDerivedType *DISSPtrTy = DIB->createPointerType(
+        DISSTy, DL.getPointerSize(), DL.getPointerABIAlignment(0).value(),
+        std::nullopt, "shadowstack_ptr");
+
+    // Create a debug local var to our opaque shadow stack block
+    DILocalVariable *DebugVar = DIB->createAutoVariable(
+        SP, "shadowstack", SP->getFile(), SP->getLine(), DISSPtrTy,
+        false, // AlwaysPreserve
+        DINode::DIFlags::FlagArtificial);
+
+    // And insert it at the beginning of the function
+    DILocation *DIL = DILocation::get(F.getContext(), SP->getLine(), 0, SP);
+    Instruction *InsertBefore = &*F.getEntryBlock().getFirstInsertionPt();
+    Instruction *First = F.getEntryBlock().getFirstNonPHI();
+    IRBuilder<> Builder(First);
+
+    // Load the shadow stack pointer out of the global variable and assign it
+    // to our debug local.
+    Value *SSPtr = Builder.CreateLoad(Int8PtrTy, ShadowCurrent);
+    DIB->insertDbgValueIntrinsic(SSPtr, DebugVar, DIB->createExpression(), DIL,
+                                 InsertBefore);
+  }
+
   // Insert main's prologue.
   //
   // Main is a little different, in that it actually allocates the shadow stack
@@ -154,8 +196,7 @@ public:
   //
   // Returns a pointer to the result of the call to malloc that was used to
   // heap allocate memory for a shadow stack.
-  CallInst *insertMainPrologue(Function *Main, GlobalVariable *SSGlobal,
-                               size_t SFrameSize) {
+  CallInst *insertMainPrologue(Function *Main, size_t SFrameSize) {
     Module *M = Main->getParent();
     Instruction *First = Main->getEntryBlock().getFirstNonPHI();
     IRBuilder<> Builder(First);
@@ -166,17 +207,19 @@ public:
     CallInst *Malloc = Builder.CreateCall(
         MF, {ConstantInt::get(PointerSizedIntTy, SHADOW_STACK_SIZE)}, "");
 
+    Builder.CreateStore(Malloc, ShadowHead);
+
     // If main() needs shadow space, reserve some.
     if (SFrameSize > 0) {
       GetElementPtrInst *GEP = GetElementPtrInst::Create(
           Int8Ty, Malloc, {ConstantInt::get(Int32Ty, SFrameSize)}, "",
           Malloc->getNextNode());
       // Update the global variable keeping track of the top of shadow stack.
-      Builder.CreateStore(GEP, SSGlobal);
+      Builder.CreateStore(GEP, ShadowCurrent);
     } else {
       // If main doesn't require any shadow stack space then we simply
       // initialise the global with the result of the call to malloc().
-      Builder.CreateStore(Malloc, SSGlobal);
+      Builder.CreateStore(Malloc, ShadowCurrent);
     }
 
     return Malloc;
@@ -190,6 +233,20 @@ public:
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+          if (!AI->getAllocationSize(DL).has_value()) {
+            // This function contains a dynamically sized alloca. We thus can't
+            // create a shadow stack for it because we can't compute the
+            // stack-frame size statically. Instead, we outline this, preventing
+            // it from being traced at all, which is a bit of a hack.
+            //
+            // This might happen with certain allocas: variable length arrays;
+            // non-const array sizes; and opaque types.
+            //
+            // YKFIXME: This could be supported if we use a bump pointer instead
+            // of calculating the high water mark in the prologue.
+            F.addFnAttr(YK_OUTLINE_FNATTR);
+            return 0;
+          }
           // Some yk specific variables that will never be traced and thus
           // can live happily on the normal stack.
           if (StructType *ST = dyn_cast<StructType>(AI->getAllocatedType())) {
@@ -242,18 +299,17 @@ public:
   //
   // Returns the shadow stack pointer before more space is allocated. Local
   // variables for the shadow frame will be pointers relative to this.
-  Value *insertShadowPrologue(Function &F, GlobalValue *SSGlobal,
-                              size_t AllocSize) {
+  Value *insertShadowPrologue(Function &F, size_t AllocSize) {
     Instruction *First = F.getEntryBlock().getFirstNonPHI();
     IRBuilder<> Builder(First);
 
     // Load the shadow stack pointer out of the global variable.
-    Value *InitSSPtr = Builder.CreateLoad(Int8PtrTy, SSGlobal);
+    Value *InitSSPtr = Builder.CreateLoad(Int8PtrTy, ShadowCurrent);
     // Add space for F's shadow frame.
     GetElementPtrInst *GEP = GetElementPtrInst::Create(
         Int8Ty, InitSSPtr, {ConstantInt::get(Int32Ty, AllocSize)}, "", First);
     // Update the global variable keeping track of the top of shadow stack.
-    Builder.CreateStore(GEP, SSGlobal);
+    Builder.CreateStore(GEP, ShadowCurrent);
 
     return InitSSPtr;
   }
@@ -279,10 +335,10 @@ public:
   /// stack pointer to it's initial value (as it was before the prologue
   /// allocate shadow sack space).
   void insertShadowEpilogues(std::vector<ReturnInst *> &Rets,
-                             GlobalVariable *SSGlobal, Value *InitSSPtr) {
+                             Value *InitSSPtr) {
     for (ReturnInst *RI : Rets) {
       IRBuilder<> Builder(RI);
-      Builder.CreateStore(InitSSPtr, SSGlobal);
+      Builder.CreateStore(InitSSPtr, ShadowCurrent);
     }
   }
 
@@ -298,8 +354,7 @@ public:
   //
   // YKFIXME: Investigate languages that don't have/use main as the first
   // entry point.
-  void updateMainFunctions(DataLayout &DL, Module &M, GlobalVariable *SSGlobal,
-                           LLVMContext &Context) {
+  void updateMainFunctions(DataLayout &DL, Module &M, LLVMContext &Context) {
     Function *Main = M.getFunction(MAIN);
     if (Main == nullptr || Main->isDeclaration()) {
       Context.emitError("Unable to add shadow stack: could not find definition "
@@ -311,7 +366,7 @@ public:
     AllocaVector MainAllocas;
     std::vector<ReturnInst *> MainRets;
     size_t SFrameSize = analyseFunction(*Main, DL, MainAllocas, MainRets);
-    CallInst *Malloc = insertMainPrologue(Main, SSGlobal, SFrameSize);
+    CallInst *Malloc = insertMainPrologue(Main, SFrameSize);
     auto MainGEPs = rewriteAllocas(DL, MainAllocas, Malloc);
 
     // If we have two control points, we need to update the cloned main
@@ -329,13 +384,13 @@ public:
       std::vector<ReturnInst *> UnoptMainRets;
       analyseFunction(*UnoptMain, DL, UnoptMainAllocas, UnoptMainRets);
 
-      // Insert a load of SSGlobal at the beginning of UnoptMain.
+      // Insert a load of ShadowCurrent at the beginning of UnoptMain.
       BasicBlock &EntryBB = UnoptMain->getEntryBlock();
       Instruction *FirstNonPHI = EntryBB.getFirstNonPHI();
       IRBuilder<> Builder(FirstNonPHI);
 
       // Load the current shadow stack pointer from the global variable.
-      LoadInst *LoadedSSPtr = Builder.CreateLoad(Int8PtrTy, SSGlobal);
+      LoadInst *LoadedSSPtr = Builder.CreateLoad(Int8PtrTy, ShadowCurrent);
       // Assert that the allocas count match between opt/unopt main
       assert(MainAllocas.size() == UnoptMainAllocas.size() &&
              "Expected same number of allocas between opt/unopt main");
@@ -364,6 +419,13 @@ public:
 
   bool run(Module &M) {
     LLVMContext &Context = M.getContext();
+    llvm::NamedMDNode *CU_Nodes = M.getNamedMetadata("llvm.dbg.cu");
+    if (CU_Nodes && CU_Nodes->getNumOperands() > 0) {
+      llvm::DICompileUnit *CU =
+          llvm::cast<llvm::DICompileUnit>(CU_Nodes->getOperand(0));
+
+      DIB = std::make_unique<DIBuilder>(M, false, CU);
+    }
 
     // Cache commonly used types.
     Int8Ty = Type::getInt8Ty(Context);
@@ -372,18 +434,26 @@ public:
     DataLayout DL(&M);
     PointerSizedIntTy = DL.getIntPtrType(Context);
 
-    // Create a global variable which will store the pointer to the heap memory
-    // used by the shadow stack.
-    //
-    // YKFIXME: This isn't thread safe. For now interpreters are assumed to be
-    // single threaded: https://github.com/ykjit/yk/issues/794
-    GlobalVariable *SSGlobal =
-        cast<GlobalVariable>(M.getOrInsertGlobal(G_SHADOW_STACK, Int8PtrTy));
-    SSGlobal->setInitializer(
-        ConstantPointerNull::get(cast<PointerType>(Int8PtrTy)));
-    SSGlobal->setThreadLocal(true);
+    GlobalVariable *ShadowSize =
+        cast<GlobalVariable>(M.getOrInsertGlobal(G_SHADOW_SIZE, Int32Ty));
+    ShadowSize->setInitializer(
+        ConstantInt::get(Int32Ty, SHADOW_STACK_SIZE, false));
+    ShadowSize->setSection(".rodata");
+    ShadowSize->setLinkage(llvm::GlobalValue::ExternalLinkage);
 
-    updateMainFunctions(DL, M, SSGlobal, Context);
+    ShadowCurrent =
+        cast<GlobalVariable>(M.getOrInsertGlobal(G_SHADOW_STACK, Int8PtrTy));
+    ShadowCurrent->setInitializer(
+        ConstantPointerNull::get(cast<PointerType>(Int8PtrTy)));
+    ShadowHead =
+        cast<GlobalVariable>(M.getOrInsertGlobal(G_SHADOW_HEAD, Int8PtrTy));
+    ShadowHead->setInitializer(
+        ConstantPointerNull::get(cast<PointerType>(Int8PtrTy)));
+
+    ShadowCurrent->setThreadLocal(true);
+    ShadowHead->setThreadLocal(true);
+
+    updateMainFunctions(DL, M, Context);
 
     // Instrument each remaining function with shadow stack code.
     for (Function &F : M) {
@@ -404,11 +474,16 @@ public:
       std::vector<ReturnInst *> Rets;
       size_t SFrameSize = analyseFunction(F, DL, Allocas, Rets);
       if (SFrameSize > 0) {
-        Value *InitSSPtr = insertShadowPrologue(F, SSGlobal, SFrameSize);
+        Value *InitSSPtr = insertShadowPrologue(F, SFrameSize);
+        insertShadowDbgInfo(F, DL, SFrameSize);
         rewriteAllocas(DL, Allocas, InitSSPtr);
-        insertShadowEpilogues(Rets, SSGlobal, InitSSPtr);
+        insertShadowEpilogues(Rets, InitSSPtr);
       }
     }
+
+    // Finalize the DIBuilder after all debug info is created
+    if (DIB)
+      DIB->finalize();
 
 #ifndef NDEBUG
     // Our pass runs after LLVM normally does its verify pass. In debug builds
