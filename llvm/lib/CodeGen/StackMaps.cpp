@@ -222,11 +222,12 @@ unsigned llvm::getDwarfRegNum(unsigned Reg, const TargetRegisterInfo *TRI) {
   return (unsigned)RegNum;
 }
 
-MachineInstr::const_mop_iterator StackMaps::parseOperand(
-    MachineInstr::const_mop_iterator MOI, MachineInstr::const_mop_iterator MOE,
-    LiveVarsVec &LiveVars, LiveOutVec &LiveOuts,
-    std::map<Register, std::set<int64_t>> SpillOffsets,
-    std::set<int64_t> TrackedRegisters, const MachineInstr *InstrMI) const {
+MachineInstr::const_mop_iterator
+StackMaps::parseOperand(MachineInstr::const_mop_iterator MOI,
+                        MachineInstr::const_mop_iterator MOE,
+                        LiveVarsVec &LiveVars, LiveOutVec &LiveOuts,
+                        std::map<Register, std::set<int64_t>> SpillOffsets,
+                        std::set<int64_t> TrackedRegisters) const {
   LocationVec &Locs = LiveVars.back();
   const TargetRegisterInfo *TRI = AP.MF->getSubtarget().getRegisterInfo();
   if (MOI->isImm()) {
@@ -321,30 +322,28 @@ MachineInstr::const_mop_iterator StackMaps::parseOperand(
     Register R = MOI->getReg();
     Register DwarfRegNum = getDwarfRegNum(R, TRI);
     std::set<int64_t> Extras;
-
     if (MOI->isReg()) {
       if (SpillOffsets.count(DwarfRegNum) > 0) {
         Extras = SpillOffsets[DwarfRegNum];
+        // Remove redundant registers/offsets that are already tracked by the
+        // stackmap or by another tracked register.
         for (auto TReg : TrackedRegisters) {
           if (TReg == DwarfRegNum) {
             continue;
           }
-          // dbgs() << "Patchpoint - erasing TReg: " << TReg << "\n";
           Extras.erase(TReg);
           for (auto X : SpillOffsets[TReg]) {
-            // if (InstrMI->getOpcode() == TargetOpcode::PATCHPOINT) {
-            //   dbgs() << "Patchpoint " << InstrMI->getOperand(0).getImm() << "
-            //   - erasing TReg: " << TReg << " with SpillOffset: "<< X << "\n";
-            // }
             Extras.erase(X);
           }
         }
       }
     }
+
     unsigned LLVMRegNum = *TRI->getLLVMRegNum(DwarfRegNum, false);
     unsigned SubRegIdx = TRI->getSubRegIndex(LLVMRegNum, R);
     if (SubRegIdx)
       Offset = TRI->getSubRegIdxOffset(SubRegIdx);
+
     Locs.emplace_back(Location::Register, TRI->getSpillSize(*RC), DwarfRegNum,
                       Offset, Extras);
     return ++MOI;
@@ -491,9 +490,9 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   LLVM_DEBUG(dbgs() << "record statepoint : " << MI << "\n");
   StatepointOpers SO(&MI);
 
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // CC
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // Flags
-  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI); // Num Deopts
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // CC
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // Flags
+  MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts); // Num Deopts
 
   // Record Deopt Args.
   unsigned NumDeoptArgs = LiveVars.back().back().Offset;
@@ -506,7 +505,7 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   while (NumDeoptArgs) {
     if (StackMaps::isNextLive(*MOI))
       NumDeoptArgs--;
-    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI);
+    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts);
   }
 
   // Record gc base/derived pairs
@@ -550,10 +549,9 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
       unsigned DerivedIdx = GCPtrIndices[P.second];
       LLVM_DEBUG(dbgs() << "Base : " << BaseIdx << " Derived : " << DerivedIdx
                         << "\n");
-      (void)parseOperand(MOB + BaseIdx, MOE, LiveVars, LiveOuts, {}, {}, &MI);
+      (void)parseOperand(MOB + BaseIdx, MOE, LiveVars, LiveOuts);
       LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
-      (void)parseOperand(MOB + DerivedIdx, MOE, LiveVars, LiveOuts, {}, {},
-                         &MI);
+      (void)parseOperand(MOB + DerivedIdx, MOE, LiveVars, LiveOuts);
       LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
     }
 
@@ -567,7 +565,7 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   unsigned NumAllocas = MOI->getImm();
   ++MOI;
   while (NumAllocas--) {
-    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, {}, {}, &MI);
+    MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts);
     LiveVars.push_back(LocationVec()); // Next ptr should be a new location.
     assert(MOI < MOE);
   }
@@ -577,15 +575,6 @@ void StackMaps::recordStackMapOpers(
     const MCSymbol &MILabel, const MachineInstr &MI, uint64_t ID,
     MachineInstr::const_mop_iterator MOI, MachineInstr::const_mop_iterator MOE,
     std::map<Register, std::set<int64_t>> SpillOffsets, bool recordResult) {
-  const char *printMachineCode = ::getenv("CP_PRINT_MACHINE_CODE");
-  if (printMachineCode && strcmp(printMachineCode, "1") == 0) {
-    dbgs() << "********** Machine Code when processing stackmap **********\n";
-    if (AP.MF) {
-      dbgs() << "Function: " << AP.MF->getName() << "\n";
-      AP.MF->print(dbgs());
-    }
-    dbgs() << "********** End of Machine Code **********\n";
-  }
   MCContext &OutContext = AP.OutStreamer->getContext();
 
   LiveVarsVec LiveVars = {LocationVec()};
@@ -594,13 +583,21 @@ void StackMaps::recordStackMapOpers(
   if (recordResult) {
     assert(PatchPointOpers(&MI).hasDef() && "Stackmap has no return value.");
     parseOperand(MI.operands_begin(), std::next(MI.operands_begin()), LiveVars,
-                 LiveOuts, SpillOffsets, {}, &MI);
+                 LiveOuts, SpillOffsets);
     LiveVars.push_back(LocationVec());
   }
 
   const TargetRegisterInfo *TRI = AP.MF->getSubtarget().getRegisterInfo();
   std::set<int64_t> TrackedRegisters;
 
+  // Patchpoints and stackmaps require different handling for operand tracking:
+  //
+  // For PATCHPOINT, we use `getStackMapStartIdx` to determine the starting
+  // index of stackmap data, allowing us to skip function call arguments
+  // embedded in the instruction.
+  //
+  // For STACKMAP, we use `getVarIdx` to get the index of variable operands
+  // and track all operands from that point onward.
   if (MI.getOpcode() == TargetOpcode::PATCHPOINT) {
     PatchPointOpers Opers(&MI);
     for (unsigned I = Opers.getStackMapStartIdx(); I < MI.getNumOperands();
@@ -619,14 +616,13 @@ void StackMaps::recordStackMapOpers(
       }
     }
   }
-
   // Parse operands.
   if (MI.getOpcode() == TargetOpcode::STATEPOINT)
     parseStatepointOpers(MI, MOI, MOE, LiveVars, LiveOuts);
   else
     while (MOI != MOE)
       MOI = parseOperand(MOI, MOE, LiveVars, LiveOuts, SpillOffsets,
-                         TrackedRegisters, &MI);
+                         TrackedRegisters);
 
   // Move large constants into the constant pool.
   for (auto &Locations : LiveVars) {
@@ -718,7 +714,7 @@ void StackMaps::recordPatchPoint(
   PatchPointOpers opers(&MI);
   const int64_t ID = opers.getID();
   auto MOI = std::next(MI.operands_begin(), opers.getStackMapStartIdx());
-  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), SpillOffsets,
+  recordStackMapOpers(L, MI, ID, MOI, MI.operands_end(), {},
                       opers.isAnyReg() && opers.hasDef());
 
 #ifndef NDEBUG
@@ -885,7 +881,6 @@ void StackMaps::emitCallsiteEntries(MCStreamer &OS) {
         if (YkStackMapAdditionalLocs) {
           OS.emitInt16(Loc.Extras.size());
           for (int64_t Extra : Loc.Extras) {
-            // dbgs() << "   @@@ Extra: " << Extra << "\n";
             OS.emitInt16(Extra);
           }
         }
