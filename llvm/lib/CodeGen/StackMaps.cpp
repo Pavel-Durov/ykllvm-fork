@@ -590,29 +590,40 @@ void StackMaps::recordStackMapOpers(
   const TargetRegisterInfo *TRI = AP.MF->getSubtarget().getRegisterInfo();
   std::set<int64_t> TrackedRegisters;
 
-  // Patchpoints and stackmaps require different handling for operand tracking:
-  //
-  // For PATCHPOINT, we use `getStackMapStartIdx` to determine the starting
-  // index of stackmap data, allowing us to skip function call arguments
-  // embedded in the instruction.
-  //
-  // For STACKMAP, we use `getVarIdx` to get the index of variable operands
-  // and track all operands from that point onward.
-  if (MI.getOpcode() == TargetOpcode::PATCHPOINT) {
-    PatchPointOpers Opers(&MI);
-    for (unsigned I = Opers.getStackMapStartIdx(); I < MI.getNumOperands();
-         I++) {
-      const MachineOperand &Op = MI.getOperand(I);
-      if (Op.isReg() && !Op.isImplicit() && !Op.isUndef()) {
-        TrackedRegisters.insert(getDwarfRegNum(Op.getReg(), TRI));
+  const char *ff = ::getenv("PATCHPOINT_FIX");
+  // apply fix by default unless disabled explicitly.
+  if (ff && strcmp(ff, "0") == 0) {
+    for (const auto *Op = MI.operands_begin(); Op != MI.operands_end(); Op++) {
+      if (Op->isReg() && !Op->isImplicit() && !Op->isUndef()) {
+        TrackedRegisters.insert(getDwarfRegNum(Op->getReg(), TRI));
       }
     }
   } else {
-    StackMapOpers Opers(&MI);
-    for (unsigned I = Opers.getVarIdx(); I < MI.getNumOperands(); I++) {
-      const MachineOperand &Op = MI.getOperand(I);
-      if (Op.isReg() && !Op.isImplicit() && !Op.isUndef()) {
-        TrackedRegisters.insert(getDwarfRegNum(Op.getReg(), TRI));
+    // Patchpoints and stackmaps require different handling for operand
+    // tracking:
+    //
+    // For PATCHPOINT, we use `getStackMapStartIdx` to determine the starting
+    // index of stackmap data, allowing us to skip function call arguments
+    // embedded in the instruction.
+    //
+    // For STACKMAP, we use `getVarIdx` to get the index of variable operands
+    // and track all operands from that point onward.
+    if (MI.getOpcode() == TargetOpcode::PATCHPOINT) {
+      PatchPointOpers Opers(&MI);
+      for (unsigned I = Opers.getStackMapStartIdx(); I < MI.getNumOperands();
+           I++) {
+        const MachineOperand &Op = MI.getOperand(I);
+        if (Op.isReg() && !Op.isImplicit() && !Op.isUndef()) {
+          TrackedRegisters.insert(getDwarfRegNum(Op.getReg(), TRI));
+        }
+      }
+    } else {
+      StackMapOpers Opers(&MI);
+      for (unsigned I = Opers.getVarIdx(); I < MI.getNumOperands(); I++) {
+        const MachineOperand &Op = MI.getOperand(I);
+        if (Op.isReg() && !Op.isImplicit() && !Op.isUndef()) {
+          TrackedRegisters.insert(getDwarfRegNum(Op.getReg(), TRI));
+        }
       }
     }
   }
