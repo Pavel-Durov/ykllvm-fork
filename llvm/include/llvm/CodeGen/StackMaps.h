@@ -327,8 +327,7 @@ private:
                MachineInstr::const_mop_iterator MOE, LiveVarsVec &LiveVars,
                LiveOutVec &LiveOuts,
                std::map<Register, std::set<int64_t>> SpillOffsets = {},
-               std::set<int64_t> TrackedRegisters = {},
-               const MachineInstr *InstrMI = nullptr) const;
+               std::set<int64_t> TrackedRegisters = {}) const;
 
   /// Specialized parser of statepoint operands.
   /// They do not directly correspond to StackMap record entries.
