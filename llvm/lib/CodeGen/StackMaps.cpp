@@ -699,6 +699,16 @@ void StackMaps::recordStackMap(
     std::map<Register, std::set<int64_t>> SpillOffsets) {
   assert(MI.getOpcode() == TargetOpcode::STACKMAP && "expected stackmap");
 
+  const char *printMachineCode = ::getenv("CP_PRINT_MACHINE_CODE");
+  if (printMachineCode && strcmp(printMachineCode, "1") == 0) {
+    dbgs() << "********** Machine Code when processing stackmap **********\n";
+    if (AP.MF) {
+      dbgs() << "Function: " << AP.MF->getName() << "\n";
+      AP.MF->print(dbgs());
+    }
+    dbgs() << "********** End of Machine Code **********\n";
+  }
+
   StackMapOpers opers(&MI);
   const int64_t ID = MI.getOperand(PatchPointOpers::IDPos).getImm();
   recordStackMapOpers(L, MI, ID,
