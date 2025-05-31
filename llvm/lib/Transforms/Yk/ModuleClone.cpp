@@ -78,8 +78,16 @@ struct YkModuleClone : public ModulePass {
       if (F.hasExternalLinkage() && F.isDeclaration()) {
         continue;
       }
+      // Function with address taken should not be cloned.
+      // Add metadata to the function to indicate that it has address taken.
+      // This metadata is used in other passes like BasicBlockTracer to inject tracing calls.
+      if (F.hasAddressTaken()) {
+        MDNode *MD = MDNode::get(Context, MDString::get(Context, "true"));
+        F.setMetadata(YK_FUNC_ADDR_TAKEN_MD_NAME, MD);
+        continue;
+      }
       // Skip already cloned functions or functions with address taken.
-      if (F.hasAddressTaken() || F.getName().startswith(YK_UNOPT_PREFIX)) {
+      if (F.getName().startswith(YK_UNOPT_PREFIX)) {
         continue;
       }
       ValueToValueMapTy VMap;
