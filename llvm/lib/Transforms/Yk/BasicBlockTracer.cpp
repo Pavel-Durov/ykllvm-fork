@@ -36,19 +36,36 @@ struct YkBasicBlockTracer : public ModulePass {
 
     FunctionType *FType = FunctionType::get(
         ReturnType, {FunctionIndexArgType, BlockIndexArgType}, false);
+
     Function *TraceFunc = Function::Create(
         FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION, M);
+
+    Function *DummyTraceFunc = Function::Create(
+        FType, GlobalVariable::ExternalLinkage, YK_TRACE_FUNCTION_DUMMY, M);
 
     IRBuilder<> builder(Context);
     uint32_t FunctionIndex = 0;
     for (auto &F : M) {
       uint32_t BlockIndex = 0;
-      // FIXME: Once control point transition is implemented,
-      //        only add tracing calls to unopt version.
       for (auto &BB : F) {
         builder.SetInsertPoint(&*BB.getFirstInsertionPt());
-        builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
-                                       builder.getInt32(BlockIndex)});
+
+        // Check if function is address-taken by looking at its metadata
+        bool isUnopt = F.getName().startswith(YK_UNOPT_PREFIX);
+        bool isAddrTaken = F.getMetadata(YK_FUNC_ADDR_TAKEN_MD_NAME) != nullptr;
+
+        if (isAddrTaken || isUnopt) {
+          // For address-taken functions or unoptimised functions, we need
+          // tracing always (because they're not duplicated but can be called
+          // while tracing)
+          builder.CreateCall(TraceFunc, {builder.getInt32(FunctionIndex),
+                                         builder.getInt32(BlockIndex)});
+        } else {
+          // Add dummy tracing calls to optimised functions
+          builder.CreateCall(DummyTraceFunc, {builder.getInt32(FunctionIndex),
+                                              builder.getInt32(BlockIndex)});
+        }
+
         assert(BlockIndex != UINT32_MAX &&
                "Expected BlockIndex to not overflow");
         BlockIndex++;
@@ -58,6 +75,10 @@ struct YkBasicBlockTracer : public ModulePass {
       FunctionIndex++;
     }
     return true;
+  }
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    // AU.setPreservesCFG();
+    AU.setPreservesAll(); // if appropriate
   }
 };
 } // namespace
