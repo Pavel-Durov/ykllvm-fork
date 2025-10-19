@@ -154,6 +154,61 @@ struct YkModuleClone : public ModulePass {
     }
   }
 
+
+  /// Replace all function calls within function `F` with calls to unoptimised
+  /// functions, if such a function exists.
+  ///
+  /// @param F The function whose calls should be updated.
+  /// @param ClonedFuncs Map from original function names to their cloned
+  ///        versions.
+  void updateCallsInFunction(Function *F,
+                             std::map<std::string, Function *> &ClonedFuncs) {
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        if (auto *Call = dyn_cast<CallInst>(&I)) {
+          Function *CalledFunc = Call->getCalledFunction();
+          if (CalledFunc && !CalledFunc->isIntrinsic()) {
+            std::string CalledName = CalledFunc->getName().str();
+            auto It = ClonedFuncs.find(CalledName);
+            if (It != ClonedFuncs.end()) {
+              Call->setCalledFunction(It->second);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /// Updates calls in module functions.
+  ///
+  /// Updates calls in unoptimised functions:
+  ///  1. Functions with __yk_unopt_ prefix.
+  ///  2. Functions which address is taken.
+  ///
+  /// This ensures all unoptimised functions call unoptimised versions of other
+  /// functions.
+  ///
+  /// @param M The LLVM module containing the functions.
+  /// @param ClonedFuncs Map from original function names to their cloned
+  ///        versions.
+  void updateFunctionCalls(Module &M,
+                           std::map<std::string, Function *> &ClonedFuncs) {
+    // Update calls within cloned functions
+    for (auto &Entry : ClonedFuncs) {
+      Function *ClonedFunc = Entry.second;
+      updateCallsInFunction(ClonedFunc, ClonedFuncs);
+    }
+
+    // Update calls within address-taken functions, since they are
+    // also treated as unoptimised functions that should call unoptimised
+    // versions of other functions
+    for (Function &F : M) {
+      if (F.getMetadata(YK_SWT_MODCLONE_FUNC_ADDR_TAKEN) != nullptr) {
+        updateCallsInFunction(&F, ClonedFuncs);
+      }
+    }
+  }
+
   bool runOnModule(Module &M) override {
     LLVMContext &Context = M.getContext();
     auto clonedFunctions = cloneFunctionsInModule(M);
@@ -161,7 +216,8 @@ struct YkModuleClone : public ModulePass {
       Context.emitError("Failed to clone functions in module");
       return false;
     }
-    updateClonedFunctionCalls(M, *clonedFunctions);
+    // updateClonedFunctionCalls(M, *clonedFunctions);
+    updateFunctionCalls(M, *clonedFunctions);
 
     if (verifyModule(M, &errs())) {
       Context.emitError("Module verification failed!");
