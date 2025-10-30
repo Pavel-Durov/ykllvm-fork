@@ -79,9 +79,20 @@ ModuleClonePass::cloneFunctionsInModule(Module &M) {
   std::vector Funcs = getFunctionsWithIR(M);
   MDNode *OptMD = MDNode::get(Context, MDString::get(Context, ""));
 
+  // Local counters for all functions and address-taken functions
+  int allFunctionCount = 0;
+  int addressTakenCount = 0;
+
   std::map<Function *, Function *> CloneMap;
   for (Function *F : Funcs) {
+    ++allFunctionCount;
+
     auto OrigName = F->getName().str();
+
+    // Check if the function has its address taken
+    if (F->hasAddressTaken()) {
+      ++addressTakenCount;
+    }
 
     // Maybe clone the function.
     Function *ClonedOptFunc = nullptr;
@@ -115,6 +126,12 @@ ModuleClonePass::cloneFunctionsInModule(Module &M) {
     // Update the map. If we didn't clone, then we insert a nullptr value.
     CloneMap[F] = ClonedOptFunc;
   }
+
+  // Print the number of all functions and address-taken functions
+  dbgs() << "Module: " << M.getName().str() 
+         << " - Total functions: " << allFunctionCount
+         << ", Address-taken functions: " << addressTakenCount << "\n";
+
   return CloneMap;
 }
 

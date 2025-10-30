@@ -12,6 +12,7 @@
 //===---------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/CodeGen/IRAnalysisPass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -1648,6 +1649,7 @@ void TargetPassConfig::addMachineLateOptimization() {
 
   // Copy propagation.
   addPass(&MachineCopyPropagationID);
+  addPass(createIRAnalysisPass());
 }
 
 /// Add standard GC passes.
