@@ -2,6 +2,9 @@
 //
 // Converts an LLVM module into Yk's on-disk AOT IR.
 //
+// Note that this serialiser now assumes that the yk basic block tracer pass
+// has been run prior.
+//
 //===-------------------------------------------------------------------===//
 
 #include "llvm/YkIR/YkIRWriter.h"
@@ -39,6 +42,7 @@ const int PPArgIdxNumTargetArgs = 3;
 // Function flags.
 const uint8_t YkFuncFlagOutline = 1;
 const uint8_t YkFuncFlagIdempotent = 2;
+const uint8_t YkFuncFlagInlineIndirect = 4;
 
 #include <sstream>
 
@@ -80,7 +84,6 @@ enum OpCode {
   OpCodePromote,
   OpCodeFNeg,
   OpCodeDebugStr,
-  OpCodePromoteIdempotent,
   OpCodeExtractValue,
   OpCodeUnimplemented = 255, // YKFIXME: Will eventually be deleted.
 };
@@ -190,21 +193,6 @@ template <class T> string toString(T *X) {
   return S;
 }
 
-// Get the index of an element in its parent container.
-template <class C, class E> size_t getIndex(C *Container, E *FindElement) {
-  bool Found = false;
-  size_t Idx = 0;
-  for (E &AnElement : *Container) {
-    if (&AnElement == FindElement) {
-      Found = true;
-      break;
-    }
-    Idx++;
-  }
-  assert(Found);
-  return Idx;
-}
-
 // An instruction index that uniquely identifies a Yk instruction within
 // a basic block.
 //
@@ -236,10 +224,7 @@ using LineInfo = tuple<PathIdx, unsigned>;
 
 // Maps an LLVM local (the instruction that creates it) to the correspoinding Yk
 // instruction index in its parent basic block.
-//
-// Note: The Yk basic block index is not stored because it's the same as
-// the LLVM IR block index, which can be found elsewhere (see `getIndex()`).
-using ValueLoweringMap = map<Instruction *, InstIdx>;
+using ValueLoweringMap = map<Instruction *, std::tuple<BBlockIdx, InstIdx>>;
 
 // Function lowering context.
 //
@@ -249,41 +234,77 @@ using ValueLoweringMap = map<Instruction *, InstIdx>;
 class FuncLowerCtxt {
   // The local variable mapping for one function.
   ValueLoweringMap VLMap;
-  // Local variable indices that require patching once we have finished
-  // lowwering the function.
-  vector<tuple<Instruction *, MCSymbol *>> InstIdxPatchUps;
+  // Local variable block and instruction indices that require patching once we
+  // have finished lowwering the function.
+  vector<tuple<Instruction *, std::tuple<MCSymbol *, MCSymbol *>>>
+      LocalVarIdxPatchUps;
 
 public:
   // Create an empty function lowering context.
-  FuncLowerCtxt() : VLMap(ValueLoweringMap()), InstIdxPatchUps({}){};
+  FuncLowerCtxt() : VLMap(ValueLoweringMap()), LocalVarIdxPatchUps({}){};
   // Maps argument operands to LoadArg instructions.
   map<Argument *, InstIdx> ArgumentMap;
 
   // Defer (patch up later) the use-site of the (as-yet unknown) instruction
   // index of the instruction  `I`, which has the symbol `Sym`.
-  void deferInstIdx(Instruction *I, MCSymbol *Sym) {
-    InstIdxPatchUps.push_back({I, Sym});
+  void deferLocalVarIdxs(Instruction *I, MCSymbol *BBIdxSym,
+                         MCSymbol *IIdxSym) {
+    LocalVarIdxPatchUps.push_back({I, {BBIdxSym, IIdxSym}});
   }
 
-  // Fill in instruction indices that had to be deferred.
-  void patchUpInstIdxs(MCStreamer &OutStreamer) {
+  // Fill in instruction and block indices that had to be deferred.
+  void patchLocalVarIdxs(MCStreamer &OutStreamer) {
     MCContext &MCtxt = OutStreamer.getContext();
-    for (auto &[Inst, Sym] : InstIdxPatchUps) {
-      InstIdx InstIdx = VLMap.at(Inst);
-      OutStreamer.emitAssignment(Sym, MCConstantExpr::create(InstIdx, MCtxt));
+    for (auto &[Inst, Syms] : LocalVarIdxPatchUps) {
+      auto [BBIdxSym, IIdxSym] = Syms;
+      auto [BBIdx, InstIdx] = VLMap.at(Inst);
+      OutStreamer.emitAssignment(BBIdxSym,
+                                 MCConstantExpr::create(BBIdx, MCtxt));
+      OutStreamer.emitAssignment(IIdxSym,
+                                 MCConstantExpr::create(InstIdx, MCtxt));
     }
   }
 
   // Add/update an entry in the value lowering map.
-  void updateVLMap(Instruction *I, InstIdx L) { VLMap[I] = L; }
+  void updateVLMap(Instruction *I, std::tuple<BBlockIdx, InstIdx> L) {
+    VLMap[I] = L;
+  }
 
   // Get the entry for `I` in the value lowering map.
   //
   // Raises `std::out_of_range` if not present.
-  InstIdx lookupInVLMap(Instruction *I) { return VLMap.at(I); }
+  std::tuple<BBlockIdx, InstIdx> lookupInVLMap(Instruction *I) {
+    return VLMap.at(I);
+  }
 
   // Determines if there's an entry for `I` in the value lowering map.
   bool vlMapContains(Instruction *I) { return VLMap.count(I) == 1; }
+};
+
+// Idenitfies the "purpose" of a basic block.
+enum BBPurpose {
+  // This block is a "is the current thread tracing?" check.
+  BBPurposeTracingCheck,
+  // This block records a basic block, if we are tracing.
+  BBPurposeRecord,
+  // This block is serialised (into yk AOT IR).
+  BBPurposeSerialise,
+};
+
+// An entry in the basic block cache.
+struct BBCacheEntry {
+  // The purpose of the block.
+  BBPurpose Purpose;
+  // The yk AOT IR basic block index that the above purpose applies to.
+  size_t BBIdx;
+  // The BBPurposeSerialiseBB LLVM IR block that this entry corresponds with.
+  BasicBlock *SerBB;
+};
+
+// An entry in the function cache.
+struct FunctionCacheEntry {
+  size_t FuncIdx;
+  size_t NumSerBBs;
 };
 
 // The class responsible for serialising our IR into the interpreter binary.
@@ -318,12 +339,11 @@ private:
   vector<llvm::Type *> Types;
   vector<llvm::Constant *> Constants;
   vector<llvm::GlobalVariable *> Globals;
-  // Maps a function to its index. This is not the same as the index in
-  // the module's function list because we skip cloned functions in
-  // serialisation.
-  std::unordered_map<llvm::Function *, size_t> FunctionIndexMap;
   // File paths.
   vector<string> Paths;
+
+  llvm::DenseMap<llvm::Function *, FunctionCacheEntry> FunctionCache;
+  llvm::DenseMap<llvm::BasicBlock *, BBCacheEntry> BBCache;
 
   // Line-level debug line info for the instructions of the module.
   //
@@ -354,6 +374,20 @@ private:
     return Idx;
   }
 
+  size_t getIndex(Function *F) { return FunctionCache.at(F).FuncIdx; }
+
+  size_t getIndex(BasicBlock *BB) {
+    const BBCacheEntry &BCE = BBCache.at(BB);
+    // The serialiser should only every need to query indices of blocks with:
+    // - The `BBPurposeTracingCheck` purpose: because branches in the blocks
+    //   we serialise go to these kinds of block.
+    // - The `BBPurposeSerialise` purpose: because the incoming edges of PHI
+    //   nodes will go to these.
+    assert(BCE.Purpose == BBPurposeTracingCheck ||
+           BCE.Purpose == BBPurposeSerialise);
+    return BCE.BBIdx;
+  }
+
   // Return the index of the LLVM constant `C`, inserting a new entry if
   // necessary.
   size_t constantIndex(Constant *C) {
@@ -380,16 +414,6 @@ private:
     return Idx;
   }
 
-  size_t functionIndex(llvm::Function *F) {
-    auto it = FunctionIndexMap.find(F);
-    if (it != FunctionIndexMap.end()) {
-      return it->second;
-    }
-    llvm::errs() << "Function not found in function index map: " << F->getName()
-                 << "\n";
-    llvm::report_fatal_error("Function not found in function index map");
-  }
-
   // Serialises a null-terminated string.
   void serialiseString(StringRef S) {
     OutStreamer.emitBinaryData(S);
@@ -409,42 +433,45 @@ private:
     // operand kind:
     serialiseOperandKind(OperandKindLocal);
     // func_idx:
-    OutStreamer.emitSizeT(getIndex(&M, I->getFunction()));
-    // bb_idx:
-    OutStreamer.emitSizeT(getIndex(I->getFunction(), I->getParent()));
+    OutStreamer.emitSizeT(getIndex(I->getFunction()));
 
-    // inst_idx:
     if (FLCtxt.vlMapContains(I)) {
-      InstIdx InstIdx = FLCtxt.lookupInVLMap(I);
+      auto [BBIdx, InstIdx] = FLCtxt.lookupInVLMap(I);
+      // bb_idx:
+      OutStreamer.emitSizeT(BBIdx);
+      // inst_idx:
       OutStreamer.emitSizeT(InstIdx);
     } else {
       // It's a local variable generated by an instruction that we haven't
       // serialised yet. This can happen in loop bodies where a PHI node merges
       // in a variable from the end of the loop body.
       //
-      // To work around this, we emit a dummy instruction index
-      // and patch it up later once it becomes known.
-      MCSymbol *PatchUpSym = OutStreamer.getContext().createTempSymbol();
-      OutStreamer.emitSymbolValue(PatchUpSym, sizeof(size_t));
-      FLCtxt.deferInstIdx(I, PatchUpSym);
+      // To work around this, we emit dummy basic block and instruction indices
+      // and patch them up later once they become known.
+      MCSymbol *PatchUpBBIdxSym = OutStreamer.getContext().createTempSymbol();
+      MCSymbol *PatchUpIIdxSym = OutStreamer.getContext().createTempSymbol();
+      // bb_idx:
+      OutStreamer.emitSymbolValue(PatchUpBBIdxSym, sizeof(size_t));
+      // inst_idx:
+      OutStreamer.emitSymbolValue(PatchUpIIdxSym, sizeof(size_t));
+      FLCtxt.deferLocalVarIdxs(I, PatchUpBBIdxSym, PatchUpIIdxSym);
     }
   }
 
   void serialiseFunctionOperand(llvm::Function *F) {
     serialiseOperandKind(OperandKindFunction);
-    OutStreamer.emitSizeT(functionIndex(F));
+    OutStreamer.emitSizeT(getIndex(F));
   }
 
   void serialiseBlockLabel(BasicBlock *BB) {
-    // Basic block indices are the same in both LLVM IR and our IR.
-    OutStreamer.emitSizeT(getIndex(BB->getParent(), BB));
+    OutStreamer.emitSizeT(getIndex(BB));
   }
 
   void serialiseArgOperand(Argument *A, FuncLowerCtxt &FLCtxt) {
     // operand kind:
     serialiseOperandKind(OperandKindLocal);
     // func_idx:
-    OutStreamer.emitSizeT(getIndex(&M, A->getParent()));
+    OutStreamer.emitSizeT(getIndex(A->getParent()));
     // bb_idx:
     OutStreamer.emitSizeT(0);
 
@@ -504,7 +531,7 @@ private:
     // right-hand side:
     serialiseOperand(I, FLCtxt, I->getOperand(1));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -598,7 +625,7 @@ private:
     // align:
     OutStreamer.emitInt64(I->getAlign().value());
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -648,22 +675,19 @@ private:
     CallInst *SMI = dyn_cast<CallInst>(I->getNextNonDebugInstruction());
     serialiseStackmapCall(SMI, FLCtxt);
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {getIndex(I->getParent()), InstIdx});
     InstIdx++;
   }
 
   void serialiseIdempotentPromotion(CallInst *I, FuncLowerCtxt &FLCtxt,
                                     unsigned &InstIdx) {
     assert(I->arg_size() == 1);
-    // opcode:
-    serialiseOpcode(OpCodePromoteIdempotent);
-    // type_idx:
-    OutStreamer.emitSizeT(typeIndex(I->getOperand(0)->getType()));
-    // value:
-    serialiseOperand(I, FLCtxt, I->getOperand(0));
-
-    FLCtxt.updateVLMap(I, InstIdx);
-    InstIdx++;
+    // We omit calls to the idempotent promotion recorder from the AOT IR, but
+    // we have to update the serialiser's book-keeping so that future
+    // references to the return value of the recorder function map to the
+    // return value of the call to the idempotent function.
+    FLCtxt.updateVLMap(
+        I, FLCtxt.lookupInVLMap(cast<Instruction>(I->getOperand(0))));
   }
 
   void serialiseDebugStr(CallInst *I, FuncLowerCtxt &FLCtxt,
@@ -677,7 +701,7 @@ private:
     // message:
     serialiseOperand(I, FLCtxt, I->getOperand(0));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {getIndex(I->getParent()), InstIdx});
     InstIdx++;
   }
 
@@ -702,7 +726,7 @@ private:
 
     // If the return type is non-void, then this defines a local.
     if (!I->getType()->isVoidTy()) {
-      FLCtxt.updateVLMap(I, InstIdx);
+      FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     }
     InstIdx++;
   }
@@ -895,7 +919,7 @@ private:
 
     serialiseOpcode(OpCodeCall);
     // callee:
-    OutStreamer.emitSizeT(functionIndex(CF));
+    OutStreamer.emitSizeT(getIndex(CF));
     // num_args:
     // (this includes static and varargs arguments)
     OutStreamer.emitInt32(I->arg_size());
@@ -937,7 +961,7 @@ private:
 
     // If the return type is non-void, then this defines a local.
     if (!I->getType()->isVoidTy()) {
-      FLCtxt.updateVLMap(I, InstIdx);
+      FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     }
     InstIdx++;
   }
@@ -1033,7 +1057,7 @@ private:
     // volatile:
     OutStreamer.emitInt8(I->isVolatile());
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1179,7 +1203,7 @@ private:
       OutStreamer.emitSizeT(DS.getZExtValue());
     }
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1242,7 +1266,7 @@ private:
     // rhs:
     serialiseOperand(I, FLCtxt, I->getOperand(1));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1323,7 +1347,7 @@ private:
     // rhs:
     serialiseOperand(I, FLCtxt, I->getOperand(1));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1378,7 +1402,7 @@ private:
     // dest_type_idx:
     OutStreamer.emitSizeT(typeIndex(I->getDestTy()));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1431,7 +1455,7 @@ private:
     // dest_type_idx:
     OutStreamer.emitSizeT(typeIndex(I->getDestTy()));
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1479,14 +1503,17 @@ private:
     OutStreamer.emitSizeT(NumIncoming);
     // incoming_bbs:
     for (size_t J = 0; J < NumIncoming; J++) {
-      serialiseBlockLabel(I->getIncomingBlock(J));
+      BasicBlock *IB = I->getIncomingBlock(J);
+      const BBCacheEntry &IBCE = BBCache.at(IB);
+      assert(IBCE.Purpose == BBPurposeSerialise);
+      serialiseBlockLabel(IB);
     }
     // incoming_vals:
     for (size_t J = 0; J < NumIncoming; J++) {
       serialiseOperand(I, FLCtxt, I->getIncomingValue(J));
     }
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1499,7 +1526,7 @@ private:
     serialiseOperand(I, FLCtxt, I->getTrueValue());
     serialiseOperand(I, FLCtxt, I->getFalseValue());
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1511,7 +1538,7 @@ private:
       // value:
       serialiseOperand(I, FLCtxt, I->getOperand(0));
 
-      FLCtxt.updateVLMap(I, InstIdx);
+      FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
       InstIdx++;
     } else {
       serialiseUnimplementedInstruction(I, FLCtxt, BBIdx, InstIdx);
@@ -1534,7 +1561,7 @@ private:
       OutStreamer.emitSizeT(Idx);
     }
 
-    FLCtxt.updateVLMap(I, InstIdx);
+    FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     InstIdx++;
   }
 
@@ -1555,8 +1582,7 @@ private:
     DebugLoc DL = I->getDebugLoc();
     if (DL) {
       DILocation *DLoc = DL.get();
-      // This could be optimised by passing the function index down.
-      FuncIdx FuncIdx = getIndex(&M, I->getFunction());
+      FuncIdx FuncIdx = getIndex(I->getFunction());
       InstID Key = {FuncIdx, BBlockIdx, InstIdx};
       stringstream Path;
 #ifdef __unix__
@@ -1643,7 +1669,7 @@ private:
     serialiseString(S);
 
     if (!I->getType()->isVoidTy()) {
-      FLCtxt.updateVLMap(I, InstIdx);
+      FLCtxt.updateVLMap(I, {BBIdx, InstIdx});
     }
     InstIdx++;
   }
@@ -1658,7 +1684,8 @@ private:
   }
 
   void serialiseBlock(BasicBlock &BB, FuncLowerCtxt &FLCtxt, unsigned &BBIdx,
-                      Function &F) {
+                      Function &F, std::vector<AllocaInst *> *EntryAllocas,
+                      std::vector<PHINode *> *PhiNodes) {
     auto ShouldSkipInstr = [](Instruction *I) {
       // Skip non-semantic instrucitons for now.
       //
@@ -1690,6 +1717,11 @@ private:
     // instrs:
     unsigned InstIdx = 0;
 
+    // Serialise any PHI nodes.
+    for (PHINode *PN : *PhiNodes) {
+      serialiseInst(PN, FLCtxt, BBIdx, InstIdx);
+    }
+
     // Insert LoadArg instructions for each argument of this function and
     // replace all Argument operands with their respective LoadArg instruction.
     // This ensures we won't have to deal with argument operands in the yk
@@ -1699,6 +1731,10 @@ private:
         serialiseLoadArg(Arg);
         FLCtxt.ArgumentMap[Arg] = InstIdx;
         InstIdx++;
+      }
+      // Serialise any entry block allocas.
+      for (AllocaInst *AI : *EntryAllocas) {
+        serialiseInst(AI, FLCtxt, BBIdx, InstIdx);
       }
     }
 
@@ -1729,6 +1765,9 @@ private:
     }
     if (F.hasFnAttribute(YK_IDEMPOTENT_FNATTR)) {
       Flags |= YkFuncFlagIdempotent;
+    }
+    if (F.hasFnAttribute(YK_INDIRECT_INLINE_FNATTR)) {
+      Flags |= YkFuncFlagInlineIndirect;
     }
     OutStreamer.emitInt8(Flags);
   }
@@ -1783,15 +1822,49 @@ private:
     if ((!F.hasFnAttribute(YK_OUTLINE_FNATTR)) || (containsControlPoint(F))) {
       // Emit a function *definition*.
       // num_blocks:
-      OutStreamer.emitSizeT(F.size());
+      //
+      // Note, this is not the same as the number of blocks in the LLVM IR
+      // because we only serialise blocks that have the `BBPurposeSerialise`
+      // purpose.
+      OutStreamer.emitSizeT(FunctionCache.at(&F).NumSerBBs);
       // blocks:
       unsigned BBIdx = 0;
       FuncLowerCtxt FLCtxt;
       std::vector<Argument> V;
+      std::vector<AllocaInst *> EntryAllocas;
+      std::vector<PHINode *> PhiNodes;
       for (BasicBlock &BB : F) {
-        serialiseBlock(BB, FLCtxt, BBIdx, F);
+        const BBCacheEntry &BCE = BBCache.at(&BB);
+        // Cache entry block allocas that we have to serialise as though they
+        // appear in the the `BBPurposeSerialiseBB` block that will come later.
+        //
+        // Why didn't we just move the allocas into that block in the LLVM IR
+        // when we added software tracing instrumentation? Because then LLVM
+        // would consider the frame dynamically sized (because allocas exist
+        // that aren't in the entry block).
+        if (BB.isEntryBlock()) {
+          assert(BCE.Purpose == BBPurposeTracingCheck);
+          for (Instruction &I : BB) {
+            if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+              EntryAllocas.push_back(AI);
+            }
+          }
+        }
+        // Similarly, cache PHI nodes (if any) at the start of any
+        // `BBPurposeTracingCheck` block. We will need to serialise those as
+        // though they appear in the `BBPurposeSerialise` block to follow.
+        if (BCE.Purpose == BBPurposeTracingCheck) {
+          for (Instruction &I : BB) {
+            if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+              PhiNodes.push_back(PN);
+            }
+          }
+        } else if (BCE.Purpose == BBPurposeSerialise) {
+          serialiseBlock(BB, FLCtxt, BBIdx, F, &EntryAllocas, &PhiNodes);
+          PhiNodes.clear();
+        }
       }
-      FLCtxt.patchUpInstIdxs(OutStreamer);
+      FLCtxt.patchLocalVarIdxs(OutStreamer);
     } else {
       checkBadYkOutline(F);
       // Emit a function *declaration*.
@@ -1980,6 +2053,72 @@ public:
   YkIRWriter(Module &M, MCStreamer &OutStreamer)
       : M(M), OutStreamer(OutStreamer), DL(&M) {}
 
+  // Return the purpose of a basic block.
+  BBPurpose getBBPurpose(BasicBlock *BB) {
+    if (MDNode *MD = BB->front().getMetadata("yk-swt-bb-purpose")) {
+      if (auto *S = dyn_cast<MDString>(MD->getOperand(0))) {
+        StringRef PS = S->getString();
+        if (PS == "swt-tracing-check-bb") {
+          return BBPurposeTracingCheck;
+        } else if (PS == "swt-record-bb") {
+          return BBPurposeRecord;
+        } else if (PS == "swt-serialise-bb") {
+          return BBPurposeSerialise;
+        } else {
+          llvm::report_fatal_error("encountered block with unknown purpose");
+        }
+      }
+    } else {
+      llvm::report_fatal_error("encountered block with no purpose: has the "
+                               "basic block racer pass been run?");
+    }
+    llvm_unreachable("failed to get bb purpose");
+  }
+
+  // Create the basic block cache and the function cache.
+  size_t createCaches() {
+    size_t FuncIdx = 0;
+    for (auto &F : M) {
+      size_t BBIdx = 0;
+      // Only make block cache entries for functions that can be traced.
+      if ((!F.hasFnAttribute(YK_OUTLINE_FNATTR)) || (containsControlPoint(F))) {
+        // The expected purpose of the next block.
+        BBPurpose Expect = BBPurposeTracingCheck;
+        std::optional<BasicBlock *> TracingCheckBB;
+        std::optional<BasicBlock *> RecordBB;
+        for (BasicBlock &BB : F) {
+          BBPurpose BP = getBBPurpose(&BB);
+          assert(BP == Expect);
+          switch (BP) {
+          case BBPurposeTracingCheck:
+            assert(!TracingCheckBB.has_value());
+            TracingCheckBB = &BB;
+            Expect = BBPurposeRecord;
+            break;
+          case BBPurposeRecord:
+            assert(!RecordBB.has_value());
+            RecordBB = &BB;
+            Expect = BBPurposeSerialise;
+            break;
+          case BBPurposeSerialise:
+            BBCache[TracingCheckBB.value()] =
+                BBCacheEntry{BBPurposeTracingCheck, BBIdx, &BB};
+            BBCache[RecordBB.value()] =
+                BBCacheEntry{BBPurposeRecord, BBIdx, &BB};
+            BBCache[&BB] = BBCacheEntry{BBPurposeSerialise, BBIdx, &BB};
+            Expect = BBPurposeTracingCheck;
+            TracingCheckBB = nullopt;
+            RecordBB = nullopt;
+            BBIdx++;
+            break;
+          }
+        }
+      }
+      FunctionCache[&F] = {FuncIdx++, BBIdx};
+    }
+    return FuncIdx;
+  }
+
   // Entry point for IR serialisation.
   //
   // The order of serialisation matters.
@@ -1998,15 +2137,9 @@ public:
     assert(IdxBitWidth <= 0xff);
     OutStreamer.emitInt8(IdxBitWidth);
 
-    // num_funcs:
-    // Count functions for serilaisation and populate functions map
-    int functionCount = 0;
-    for (llvm::Function &F : M) {
-      FunctionIndexMap[&F] = functionCount;
-      functionCount++;
-    }
+    size_t NumFuncs = createCaches();
     // Emit the number of functions
-    OutStreamer.emitSizeT(functionCount);
+    OutStreamer.emitSizeT(NumFuncs);
     // funcs:
     for (llvm::Function &F : M) {
       serialiseFunc(F);
