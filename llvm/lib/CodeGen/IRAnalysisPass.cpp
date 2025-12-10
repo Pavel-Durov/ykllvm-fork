@@ -7,6 +7,8 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Yk/ModuleClone.h"
+#include "llvm/YkIR/YkIRWriter.h"
 #include <algorithm>
 #include <cstddef>
 #include <fstream>
@@ -23,6 +25,7 @@ namespace {
 const bool PrintMIR = false;
 const bool CountAddressTakenFunctions = true;
 const char *CSV_OUTPUT_PATH = "/home/pd/ir_analysis_basicblocks.csv";
+const char *FUNC_STATS_CSV_PATH = "/home/pd/ir_analysis_function_stats.csv";
 
 struct FunctionStats {
   std::string functionName;
@@ -42,7 +45,7 @@ struct BasicBlockInfo {
 static std::string escapeCSVField(const std::string &field) {
   bool needsQuotes = false;
   std::string result;
-  
+
   // Check if the field contains special characters
   if (field.find(',') != std::string::npos ||
       field.find('"') != std::string::npos ||
@@ -50,7 +53,7 @@ static std::string escapeCSVField(const std::string &field) {
       field.find('\r') != std::string::npos) {
     needsQuotes = true;
   }
-  
+
   if (needsQuotes) {
     result = "\"";
     for (char c : field) {
@@ -64,7 +67,7 @@ static std::string escapeCSVField(const std::string &field) {
   } else {
     result = field;
   }
-  
+
   return result;
 }
 
@@ -94,15 +97,27 @@ private:
   std::vector<FunctionStats> functionStats;
   // Track address-taken functions
   std::set<std::string> addressTakenFunctions;
+  // Track optimised functions (cloned with YK_SWT_OPT_MD metadata)
+  std::set<std::string> optFunctions;
+  // Track unoptimised functions (with OptimizeNone attribute)
+  std::set<std::string> unoptFunctions;
+  // Track outlined functions (with yk_outline attribute)
+  std::set<std::string> outlinedFunctions;
   // Vector to store basic block information with instructions
   std::vector<BasicBlockInfo> basicBlockInfoList;
   // Track if CSV header has been written
   bool csvHeaderWritten;
+  // Track if function stats CSV header has been written
+  bool funcStatsCsvHeaderWritten;
+  // Function index counter
+  size_t functionIndex;
 };
 
 } // namespace llvm
 
-IRAnalysisPass::IRAnalysisPass() : MachineFunctionPass(ID), csvHeaderWritten(false) {
+IRAnalysisPass::IRAnalysisPass()
+    : MachineFunctionPass(ID), csvHeaderWritten(false),
+      funcStatsCsvHeaderWritten(false), functionIndex(0) {
   initializeIRAnalysisPassPass(*PassRegistry::getPassRegistry());
 }
 
@@ -113,9 +128,18 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
   const Function &F = MF.getFunction();
   std::string functionName = MF.getName().str();
 
-  // Track address-taken functions
   if (CountAddressTakenFunctions && F.hasAddressTaken()) {
+    // Track address-taken functions
     addressTakenFunctions.insert(functionName);
+  } else if (F.getMetadata(YK_SWT_OPT_MD)) {
+    // Track optimised functions (those with YK_SWT_OPT_MD metadata)
+    optFunctions.insert(functionName);
+  } else if (F.hasFnAttribute(YK_OUTLINE_FNATTR)) {
+    // Track outlined functions (those with yk_outline attribute)
+    outlinedFunctions.insert(functionName);
+  } else {
+    // Track unoptimised functions (those with OptimizeNone attribute)
+    unoptFunctions.insert(functionName);
   }
 
   // Count AOT IR basic blocks and instructions (excluding debug info)
@@ -137,17 +161,17 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
   size_t numMIRInsts = 0;
   for (const MachineBasicBlock &MBB : MF) {
     numMIRBBs++;
-    
+
     // Create basic block info
     BasicBlockInfo bbInfo;
     bbInfo.functionName = functionName;
     bbInfo.basicBlockId = "BB#" + std::to_string(MBB.getNumber());
-    
+
     for (const MachineInstr &MI : MBB) {
       // Exclude debug instructions from the count
       if (!MI.isDebugInstr()) {
         numMIRInsts++;
-        
+
         // Convert instruction to string
         std::string instrStr;
         raw_string_ostream rso(instrStr);
@@ -155,13 +179,15 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
         rso.flush();
 
         // Remove newlines and clean up the string
-        instrStr.erase(std::remove(instrStr.begin(), instrStr.end(), '\n'), instrStr.end());
-        instrStr.erase(std::remove(instrStr.begin(), instrStr.end(), '\r'), instrStr.end());
-        
+        instrStr.erase(std::remove(instrStr.begin(), instrStr.end(), '\n'),
+                       instrStr.end());
+        instrStr.erase(std::remove(instrStr.begin(), instrStr.end(), '\r'),
+                       instrStr.end());
+
         bbInfo.instructions.push_back(instrStr);
       }
     }
-    
+
     // Only add basic blocks that have instructions
     if (!bbInfo.instructions.empty()) {
       basicBlockInfoList.push_back(bbInfo);
@@ -186,17 +212,18 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
 
   // Write basic block information to CSV file incrementally
   std::ofstream csvFile;
-  
+
   // Check if file exists to determine if we need to write header
   std::ifstream checkFile(CSV_OUTPUT_PATH);
   bool fileExists = checkFile.good();
   checkFile.close();
-  
+
   if (!fileExists && !csvHeaderWritten) {
     // First time: create file and write header
     csvFile.open(CSV_OUTPUT_PATH, std::ios::out);
     if (csvFile.is_open()) {
-      csvFile << "function_name,basicblock_id,number_of_instructions,instructions\n";
+      csvFile << "function_name,basicblock_id,number_of_instructions,"
+                 "instructions\n";
       csvHeaderWritten = true;
       errs() << "Created CSV file: " << CSV_OUTPUT_PATH << "\n";
     } else {
@@ -207,7 +234,8 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
     // Append mode - file exists or header already written
     csvFile.open(CSV_OUTPUT_PATH, std::ios::app);
     if (!csvFile.is_open()) {
-      errs() << "Error: Could not open CSV file for appending: " << CSV_OUTPUT_PATH << "\n";
+      errs() << "Error: Could not open CSV file for appending: "
+             << CSV_OUTPUT_PATH << "\n";
       return false;
     }
     csvHeaderWritten = true;
@@ -231,14 +259,66 @@ bool IRAnalysisPass::runOnMachineFunction(MachineFunction &MF) {
         }
         std::string escapedInstructions = escapeCSVField(instructionsStr);
 
-        csvFile << escapedFunctionName << ","
-                << escapedBasicBlockId << ","
-                << bbInfo.instructions.size() << ","
-                << escapedInstructions << "\n";
+        csvFile << escapedFunctionName << "," << escapedBasicBlockId << ","
+                << bbInfo.instructions.size() << "," << escapedInstructions
+                << "\n";
       }
     }
     csvFile.close();
   }
+
+  // Write function stats to CSV file
+  std::ofstream funcStatsCsvFile;
+
+  // Check if file exists to determine if we need to write header
+  std::ifstream checkFuncStatsFile(FUNC_STATS_CSV_PATH);
+  bool funcStatsFileExists = checkFuncStatsFile.good();
+  checkFuncStatsFile.close();
+
+  if (!funcStatsFileExists && !funcStatsCsvHeaderWritten) {
+    // First time: create file and write header
+    funcStatsCsvFile.open(FUNC_STATS_CSV_PATH, std::ios::out);
+    if (funcStatsCsvFile.is_open()) {
+      funcStatsCsvFile << "function_name,function_index,is_optimised,is_"
+                          "unoptimised,is_address_taken,is_outlined\n";
+      funcStatsCsvHeaderWritten = true;
+      errs() << "Created function stats CSV file: " << FUNC_STATS_CSV_PATH
+             << "\n";
+    } else {
+      errs() << "Error: Could not create function stats CSV file: "
+             << FUNC_STATS_CSV_PATH << "\n";
+      return false;
+    }
+  } else {
+    // Append mode - file exists or header already written
+    funcStatsCsvFile.open(FUNC_STATS_CSV_PATH, std::ios::app);
+    if (!funcStatsCsvFile.is_open()) {
+      errs() << "Error: Could not open function stats CSV file for appending: "
+             << FUNC_STATS_CSV_PATH << "\n";
+      return false;
+    }
+    funcStatsCsvHeaderWritten = true;
+  }
+
+  if (funcStatsCsvFile.is_open()) {
+    // Determine boolean flags for this function
+    bool isOptimised = optFunctions.count(functionName) > 0;
+    bool isUnoptimised = unoptFunctions.count(functionName) > 0;
+    bool isAddressTaken = addressTakenFunctions.count(functionName) > 0;
+    bool isOutlined = outlinedFunctions.count(functionName) > 0;
+
+    std::string escapedFunctionName = escapeCSVField(functionName);
+
+    funcStatsCsvFile << escapedFunctionName << "," << functionIndex << ","
+                     << (isOptimised ? "true" : "false") << ","
+                     << (isUnoptimised ? "true" : "false") << ","
+                     << (isAddressTaken ? "true" : "false") << ","
+                     << (isOutlined ? "true" : "false") << "\n";
+    funcStatsCsvFile.close();
+  }
+
+  // Increment function index for the next function
+  functionIndex++;
 
   return false;
 }
@@ -252,47 +332,56 @@ IRAnalysisPass::~IRAnalysisPass() {
 
     double avgIRInstsPerBlock =
         stats.numIRBasicBlocks > 0
-            ? static_cast<double>(stats.numIRInstructions) / stats.numIRBasicBlocks
+            ? static_cast<double>(stats.numIRInstructions) /
+                  stats.numIRBasicBlocks
             : 0.0;
 
     double avgMIRInstsPerBlock =
         stats.numMIRBasicBlocks > 0
-            ? static_cast<double>(stats.numMIRInstructions) / stats.numMIRBasicBlocks
+            ? static_cast<double>(stats.numMIRInstructions) /
+                  stats.numMIRBasicBlocks
             : 0.0;
 
     errs() << "Module: " << moduleName << "\n"
            << "  AOT IR Statistics:\n"
            << "    Total Basic Blocks: " << stats.numIRBasicBlocks << "\n"
            << "    Total Instructions: " << stats.numIRInstructions << "\n"
-           << "    Average Instructions per Block: " << avgIRInstsPerBlock << "\n"
+           << "    Average Instructions per Block: " << avgIRInstsPerBlock
+           << "\n"
            << "  MIR Statistics:\n"
            << "    Total Basic Blocks: " << stats.numMIRBasicBlocks << "\n"
            << "    Total Instructions: " << stats.numMIRInstructions << "\n"
-           << "    Average Instructions per Block: " << avgMIRInstsPerBlock << "\n\n";
+           << "    Average Instructions per Block: " << avgMIRInstsPerBlock
+           << "\n\n";
   }
   errs() << "===========================\n";
 
-  // Print address-taken functions if enabled
-  if (CountAddressTakenFunctions && !addressTakenFunctions.empty()) {
-    errs() << "\n=== Address-Taken Functions ===\n";
-    errs() << "Total: " << addressTakenFunctions.size() << "\n";
-    for (const auto &funcName : addressTakenFunctions) {
-      errs() << "  " << funcName << "\n";
-    }
-    errs() << "==============================\n";
-  }
+  // Print function statistics
+  errs() << "\n=== Function Statistics ===\n";
+  errs() << "Total Functions: " << functionStats.size() << "\n";
+  errs() << "Optimised Functions: " << optFunctions.size() << "\n";
+  errs() << "Unoptimised Functions: " << unoptFunctions.size() << "\n";
+  errs() << "Address-Taken Functions: " << addressTakenFunctions.size() << "\n";
+  errs() << "Outlined Functions: " << outlinedFunctions.size() << "\n";
+  errs() << "===========================\n";
 
   // CSV file was written incrementally during pass execution
   if (csvHeaderWritten) {
-    errs() << "\nBasic block information written to: " << CSV_OUTPUT_PATH << "\n";
-    errs() << "Total basic blocks processed: " << basicBlockInfoList.size() << "\n";
+    errs() << "\nBasic block information written to: " << CSV_OUTPUT_PATH
+           << "\n";
+    errs() << "Total basic blocks processed: " << basicBlockInfoList.size()
+           << "\n";
+  }
+
+  if (funcStatsCsvHeaderWritten) {
+    errs() << "Function statistics written to: " << FUNC_STATS_CSV_PATH << "\n";
   }
 }
 
 char IRAnalysisPass::ID = 0;
-INITIALIZE_PASS(IRAnalysisPass, "ir-analysis-pass", "IR Analysis Pass", false, false)
+INITIALIZE_PASS(IRAnalysisPass, "ir-analysis-pass", "IR Analysis Pass", false,
+                false)
 
 namespace llvm {
 MachineFunctionPass *createIRAnalysisPass() { return new IRAnalysisPass(); }
 } // namespace llvm
-

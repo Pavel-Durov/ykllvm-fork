@@ -61,7 +61,6 @@
 #include "llvm/Transforms/Yk/MarkTraceableOptNone.h"
 #include "llvm/Transforms/Yk/NoCallsInEntryBlocks.h"
 #include "llvm/Transforms/Yk/BasicBlockTracer.h"
-#include "llvm/Transforms/Yk/ShimCallees.h"
 #include <cassert>
 #include <optional>
 #include <string>
@@ -1203,10 +1202,6 @@ bool TargetPassConfig::addISelPasses() {
 
   if (YkBasicBlockTracer) {
     addPass(createYkBasicBlockTracerPass());
-  }
-
-  if (YkShimCallees) {
-    addPass(createYkShimCalleesPass());
   }
 
   addISelPrepare();
