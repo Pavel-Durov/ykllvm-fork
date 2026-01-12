@@ -30,6 +30,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Yk/ControlPoint.h"
 #include "llvm/YkIR/YkIRWriter.h"
 
@@ -109,6 +110,15 @@ struct YkBasicBlockTracer : public ModulePass {
     MDNode *SerialiseBBMD =
         MDNode::get(Context, MDString::get(Context, "swt-serialise-bb"));
 
+    // Counters for block statistics.
+    uint64_t TotalBlocks = 0;
+    uint64_t BlocksSingleSuccessor = 0;
+    uint64_t BlocksWithoutCallsOrLongjmp = 0;
+    uint64_t BlocksWithoutCallsSingleSuccessor = 0;
+    uint64_t BlocksWithoutCallsNotOutlined = 0;
+    uint64_t BlocksWithoutCallsNotOutlinedSingleExit = 0;
+    uint64_t BlocksWithoutCallsNotOutlinedSingleSuccessor = 0;
+
     uint32_t FunctionIndex = 0;
     for (auto &F : M) {
       // If we won't ever trace this, don't insert calls to the tracer, as it
@@ -126,6 +136,60 @@ struct YkBasicBlockTracer : public ModulePass {
 
       uint32_t BlockIndex = 0;
       for (BasicBlock *BB : BBs) {
+        // Count total blocks.
+        TotalBlocks++;
+
+        // Check if this block has any direct/indirect calls or longjumps.
+        bool HasCallOrLongjmp = false;
+        for (Instruction &I : *BB) {
+          if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+            // Check if it's a call to longjmp/setjmp variants.
+            Function *Callee = CI->getCalledFunction();
+            if (Callee) {
+              StringRef Name = Callee->getName();
+              if (Name == "longjmp" || Name == "_longjmp" ||
+                  Name == "siglongjmp" || Name == "__longjmp_chk") {
+                HasCallOrLongjmp = true;
+                break;
+              }
+            }
+            // Any other call (direct or indirect) counts.
+            HasCallOrLongjmp = true;
+            break;
+          } else if (isa<InvokeInst>(&I)) {
+            // Invoke is also a call (with exception handling).
+            HasCallOrLongjmp = true;
+            break;
+          }
+        }
+        
+        Instruction *Term = BB->getTerminator();
+        auto NumSuccessors = Term ? Term->getNumSuccessors() : 0;
+
+        if (NumSuccessors == 1) {
+          BlocksSingleSuccessor++;
+        }
+        if (!HasCallOrLongjmp) {
+          BlocksWithoutCallsOrLongjmp++;
+
+          if (NumSuccessors == 1) {
+            BlocksWithoutCallsSingleSuccessor++;
+          }
+
+          // Also count blocks without calls that are not in outlined functions.
+          if (!F.hasFnAttribute(YK_OUTLINE_FNATTR)) {
+            BlocksWithoutCallsNotOutlined++;
+            // Count blocks with single exit point (0 or 1 successor).
+            if (Term && Term->getNumSuccessors() <= 1) {
+              BlocksWithoutCallsNotOutlinedSingleExit++;
+
+              if (NumSuccessors == 1) {
+                BlocksWithoutCallsNotOutlinedSingleSuccessor++;
+              }
+            }
+          }
+        }
+
         // If there are allocas in an entry block, then they have to stay
         // there, otherwise stackmaps will consider the frame to have dynamic
         // size (and we won't know how big the frame is at runtime).
@@ -207,6 +271,22 @@ struct YkBasicBlockTracer : public ModulePass {
              "Expected FunctionIndex to not overflow");
       FunctionIndex++;
     }
+
+    // Print block statistics.
+    errs() << "BasicBlockTracer: Total blocks: " << TotalBlocks << "\n";
+    errs() << "BasicBlockTracer: Blocks with single successor: "
+           << BlocksSingleSuccessor << "\n";
+    errs() << "BasicBlockTracer: Blocks without calls or longjmp: "
+           << BlocksWithoutCallsOrLongjmp << "\n";
+    errs() << "BasicBlockTracer: Blocks without calls (single successor): "
+           << BlocksWithoutCallsSingleSuccessor << "\n";
+    errs() << "BasicBlockTracer: Blocks without calls (not outlined): "
+           << BlocksWithoutCallsNotOutlined << "\n";
+    errs() << "BasicBlockTracer: Blocks without calls (not outlined, single exit): "
+           << BlocksWithoutCallsNotOutlinedSingleExit << "\n";
+    errs() << "BasicBlockTracer: Blocks without calls (not outlined, single successor): "
+           << BlocksWithoutCallsNotOutlinedSingleSuccessor << "\n";
+
     return true;
   }
 };
