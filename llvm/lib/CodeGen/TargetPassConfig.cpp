@@ -12,6 +12,7 @@
 //===---------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/CodeGen/IRAnalysisPass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -60,7 +61,6 @@
 #include "llvm/Transforms/Yk/MarkTraceableOptNone.h"
 #include "llvm/Transforms/Yk/NoCallsInEntryBlocks.h"
 #include "llvm/Transforms/Yk/BasicBlockTracer.h"
-#include "llvm/Transforms/Yk/ModuleClone.h"
 #include <cassert>
 #include <optional>
 #include <string>
@@ -1648,6 +1648,9 @@ void TargetPassConfig::addMachineLateOptimization() {
 
   // Copy propagation.
   addPass(&MachineCopyPropagationID);
+  
+  // IR Analysis Pass - collects statistics for AOT IR and MIR
+  addPass(createIRAnalysisPass());
 }
 
 /// Add standard GC passes.
