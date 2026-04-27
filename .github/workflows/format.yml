@@ -1,0 +1,30 @@
+name: Format check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          codename=$(lsb_release -cs)
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-23 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-23
+
+      - name: Stage clang-format where the script expects it
+        run: |
+          mkdir -p build/bin
+          ln -s "$(command -v clang-format-23)" build/bin/clang-format
+
+      - name: Run formatter
+        run: sh yk_format_new_files.sh
+
+      - name: Verify no formatting changes
+        run: git diff --exit-code
