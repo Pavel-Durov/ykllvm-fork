@@ -27,9 +27,7 @@
 #include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineModuleInfoImpls.h"
-#include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGenTypes/MachineValueType.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -88,25 +86,6 @@ int getDwarfRegNumFallible(unsigned Reg, const TargetRegisterInfo *TRI) {
   // In Stackmaps.cpp there was an assertion here checking RegNum >= 0 and the
   // return value was casted unsigned.
   return RegNum;
-}
-
-bool isSlotZExtLoad(const MachineInstr &MI) {
-  switch (MI.getOpcode()) {
-  case X86::MOVZX32rm8:
-  case X86::MOVZX32rm16:
-  case X86::MOVZX64rm8:
-  case X86::MOVZX64rm16: {
-    SmallVector<const MachineMemOperand *, 1> Accesses;
-    if (!TII->hasLoadFromStackSlot(MI, Accesses) || Accesses.size() != 1)
-      return false;
-    int FI = cast<FixedStackPseudoSourceValue>(Accesses[0]->getPseudoValue())
-                 ->getFrameIndex();
-    return Accesses[0]->getSize() ==
-           LocationSize::precise(MI.getMF()->getFrameInfo().getObjectSize(FI));
-  }
-  default:
-    return false;
-  }
 }
 
 /// Given a MachineBasicBlock, analyse its instructions and try to figure out
@@ -186,8 +165,7 @@ void processInstructions(
 
     // A value from the stack was loaded back into a register. Create a mapping from
     // that register to the stack offset.
-    if (TII->isLoadFromStackSlotPostFE(Instr, FI) ||
-        isSlotZExtLoad(Instr)) {
+    if (TII->isLoadFromStackSlotPostFE(Instr, FI)) {
       const MachineOperand OffsetOp = Instr.getOperand(4);
       const MachineOperand Lhs = Instr.getOperand(0);
       assert(Lhs.isReg() && "Is register.");
